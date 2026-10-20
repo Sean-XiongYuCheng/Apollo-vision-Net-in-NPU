@@ -1,0 +1,9 @@
+.git
+**/.git
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.bak
+**/work_dirs
+docker/*.log
+/Apollo-Vision-Net/data
