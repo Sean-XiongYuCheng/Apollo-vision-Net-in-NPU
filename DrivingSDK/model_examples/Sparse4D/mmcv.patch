@@ -1,0 +1,27 @@
+diff --git a/mmcv/parallel/distributed.py b/mmcv/parallel/distributed.py
+index bf34cb59..f0dfecc9 100644
+--- a/mmcv/parallel/distributed.py
++++ b/mmcv/parallel/distributed.py
+@@ -156,8 +156,7 @@ class MMDistributedDataParallel(DistributedDataParallel):
+         Returns:
+             Any: Forward result of :attr:`module`.
+         """
+-        module_to_run = self._replicated_tensor_module if \
+-            self._use_replicated_tensor_module else self.module
++        module_to_run = self.module
+ 
+         if self.device_ids:
+             inputs, kwargs = self.to_kwargs(  # type: ignore
+diff --git a/mmcv/runner/checkpoint.py b/mmcv/runner/checkpoint.py
+index 9dd2d311..576677c1 100644
+--- a/mmcv/runner/checkpoint.py
++++ b/mmcv/runner/checkpoint.py
+@@ -331,7 +331,7 @@ def load_from_local(
+     filename = osp.expanduser(filename)
+     if not osp.isfile(filename):
+         raise FileNotFoundError(f'{filename} can not be found.')
+-    checkpoint = torch.load(filename, map_location=map_location)
++    checkpoint = torch.load(filename, map_location=map_location, weights_only=False)
+     return checkpoint
+ 
+ 

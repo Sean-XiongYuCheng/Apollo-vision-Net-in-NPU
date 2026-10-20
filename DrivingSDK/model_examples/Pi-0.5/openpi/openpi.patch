@@ -1,0 +1,104 @@
+diff --git a/scripts/train_pytorch.py b/scripts/train_pytorch.py
+index c7ddd2b..53f2c2e 100644
+--- a/scripts/train_pytorch.py
++++ b/scripts/train_pytorch.py
+@@ -31,6 +31,9 @@ import platform
+ import shutil
+ import time
+ 
++import torch_npu
++from torch_npu.contrib import transfer_to_npu
++
+ import jax
+ import numpy as np
+ import safetensors.torch
+diff --git a/src/openpi/models/tokenizer.py b/src/openpi/models/tokenizer.py
+index 8a4966d..ed70ac4 100644
+--- a/src/openpi/models/tokenizer.py
++++ b/src/openpi/models/tokenizer.py
+@@ -9,13 +9,18 @@ from transformers import AutoProcessor
+ 
+ import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
+ import openpi.shared.download as download
++import pathlib
+ 
+ 
+ class PaligemmaTokenizer:
+     def __init__(self, max_len: int = 48):
+         self._max_len = max_len
+ 
+-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
++        path = os.getenv("PALIGEMMA_TOKENIZER_PATH")
++        if path is None:
++            path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
++        else:
++            path = pathlib.Path(path)
+         with path.open("rb") as f:
+             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+ 
+diff --git a/src/openpi/training/config.py b/src/openpi/training/config.py
+index 4ca47e1..b8ce9f1 100644
+--- a/src/openpi/training/config.py
++++ b/src/openpi/training/config.py
+@@ -5,6 +5,7 @@ from collections.abc import Sequence
+ import dataclasses
+ import difflib
+ import logging
++import os
+ import pathlib
+ from typing import Any, Literal, Protocol, TypeAlias
+ 
+@@ -302,10 +303,10 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
+             inputs=[
+                 _transforms.RepackTransform(
+                     {
+-                        "observation/image": "image",
+-                        "observation/wrist_image": "wrist_image",
+-                        "observation/state": "state",
+-                        "actions": "actions",
++                        "observation/image": "observation.images.image",
++                        "observation/wrist_image": "observation.images.wrist_image",
++                        "observation/state": "observation.state",
++                        "actions": "action",
+                         "prompt": "prompt",
+                     }
+                 )
+@@ -352,6 +353,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
+             repack_transforms=repack_transform,
+             data_transforms=data_transforms,
+             model_transforms=model_transforms,
++            action_sequence_keys=("action",),
+         )
+ 
+ 
+@@ -744,7 +746,7 @@ _CONFIGS = [
+         name="pi05_libero",
+         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+         data=LeRobotLiberoDataConfig(
+-            repo_id="physical-intelligence/libero",
++            repo_id=os.getenv("LIBERO_DATASET_REPO_ID", "physical-intelligence/libero"),
+             base_config=DataConfig(prompt_from_task=True),
+             extra_delta_transform=False,
+         ),
+@@ -758,7 +760,7 @@ _CONFIGS = [
+         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+         ema_decay=0.999,
+         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
++        pytorch_weight_path=os.getenv("PYTORCH_WEIGHT_PATH", "/path/to/your/pytorch_weight_path"),
+         num_train_steps=30_000,
+     ),
+     #
+diff --git a/src/openpi/training/data_loader.py b/src/openpi/training/data_loader.py
+index e2ee7dd..3cfb81a 100644
+--- a/src/openpi/training/data_loader.py
++++ b/src/openpi/training/data_loader.py
+@@ -7,7 +7,7 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
+ 
+ import jax
+ import jax.numpy as jnp
+-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
++import lerobot.datasets.lerobot_dataset as lerobot_dataset
+ import numpy as np
+ import torch
+ 

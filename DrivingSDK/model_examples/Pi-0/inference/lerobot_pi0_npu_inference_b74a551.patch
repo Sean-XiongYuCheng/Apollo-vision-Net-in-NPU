@@ -1,0 +1,2336 @@
+diff --git a/src/lerobot/policies/pi0/configuration_pi0.py b/src/lerobot/policies/pi0/configuration_pi0.py
+index a06315f0751aca06638a53d509d49494c4c75d56..e06cf1622f21903ebe4e446976d150e3b2aa2128 100644
+--- a/src/lerobot/policies/pi0/configuration_pi0.py
++++ b/src/lerobot/policies/pi0/configuration_pi0.py
+@@ -30,7 +30,8 @@ DEFAULT_IMAGE_SIZE = 224
+ class PI0Config(PreTrainedConfig):
+     paligemma_variant: str = "gemma_2b"
+     action_expert_variant: str = "gemma_300m"
+-    dtype: str = "float32"  # Options: "bfloat16", "float32"
++    # PI0 推理数据精度。bfloat16 在设备不支持时自动回退到 float32。
++    dtype: str = "bfloat16"  # Options: "bfloat16", "float32"
+ 
+     n_obs_steps: int = 1
+     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
+@@ -80,7 +81,15 @@ class PI0Config(PreTrainedConfig):
+     gradient_checkpointing: bool = False  # Enable gradient checkpointing for memory optimization
+     compile_model: bool = False  # Whether to use torch.compile for model optimization
+     compile_mode: str = "max-autotune"  # Torch compile mode
+-    device: str | None = None  # Device to use for the model (None = auto-detect)
++    # PI0 NPU 推理默认固化为 bf16 + TorchAir 图编译路径。
++    compile_inference_graph: bool = True  # Compile pi0 inference graph fragments
++    compile_inference_backend: str | None = "torchair"
++    compile_inference_fullgraph: bool = True
++    compile_inference_dynamic: bool = False
++    # TorchAir/GE 编译选项：冻结参数并打开 tiling 调度优化，减少 NPU 编译图运行开销。
++    compile_frozen_parameter: bool = True
++    compile_tiling_schedule_optimize: bool = True
++    device: str | None = None
+ 
+     # Finetuning settings
+     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
+@@ -119,6 +128,8 @@ class PI0Config(PreTrainedConfig):
+ 
+         if self.dtype not in ["bfloat16", "float32"]:
+             raise ValueError(f"Invalid dtype: {self.dtype}")
++        if self.compile_inference_backend not in [None, "auto", "torchair", "npugraph_ex", "inductor"]:
++            raise ValueError(f"Invalid compile_inference_backend: {self.compile_inference_backend!r}")
+ 
+     def validate_features(self) -> None:
+         """Validate and set up input/output features."""
+diff --git a/src/lerobot/policies/pi0/modeling_pi0.py b/src/lerobot/policies/pi0/modeling_pi0.py
+index f6f4212fbc14c5284dfe7b4be9199c45337e6a78..464bc14d4451f9760fb6aab23a0509100a09ddf4 100644
+--- a/src/lerobot/policies/pi0/modeling_pi0.py
++++ b/src/lerobot/policies/pi0/modeling_pi0.py
+@@ -17,9 +17,12 @@
+ import builtins
+ import logging
+ import math
++import os
++import sys
++import types
+ from collections import deque
+ from pathlib import Path
+-from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
++from typing import TYPE_CHECKING, Any, Literal, TypedDict, Unpack
+ 
+ import torch
+ import torch.nn.functional as F  # noqa: N812
+@@ -29,7 +32,7 @@ from lerobot.utils.import_utils import _transformers_available, require_package
+ 
+ # Conditional import for type checking and lazy loading
+ if TYPE_CHECKING or _transformers_available:
+-    from transformers.cache_utils import DynamicCache
++    from transformers.cache_utils import DynamicCache, DynamicLayer
+     from transformers.models.auto import CONFIG_MAPPING
+     from transformers.models.gemma import modeling_gemma
+ 
+@@ -42,6 +45,7 @@ if TYPE_CHECKING or _transformers_available:
+ else:
+     CONFIG_MAPPING = None
+     DynamicCache = None
++    DynamicLayer = None
+     modeling_gemma = None
+     PiGemmaForCausalLM = None
+     _gated_residual = None
+@@ -61,6 +65,7 @@ from lerobot.utils.constants import (
+ from ..pretrained import PreTrainedPolicy, T
+ from ..rtc.modeling_rtc import RTCProcessor
+ from .configuration_pi0 import DEFAULT_IMAGE_SIZE, PI0Config
++from .vision_siglip_npu import PI0SiglipVisionModel
+ 
+ 
+ class ActionSelectKwargs(TypedDict, total=False):
+@@ -69,10 +74,32 @@ class ActionSelectKwargs(TypedDict, total=False):
+     execution_horizon: int | None
+ 
+ 
++PI0_GRAPH_DENOISE_STEPS = 10
++PI0_ENABLE_VISION_NPU_PFA_ENV = "LEROBOT_PI0_ENABLE_VISION_NPU_PFA"
++
++
++def _apply_fixed_pi0_inference_config(config: PI0Config) -> None:
++    """Pin PI0 inference to the optimized NPU path used by this branch."""
++    config.dtype = "bfloat16"
++    config.num_inference_steps = PI0_GRAPH_DENOISE_STEPS
++    config.gradient_checkpointing = False
++    config.compile_model = False
++    config.compile_inference_graph = True
++    config.compile_inference_backend = "torchair"
++    # Keep torch.compile fullgraph capture for each compiled fragment, while
++    # using two fragments: prefix prefill graph + fixed 10-step denoise graph.
++    config.compile_inference_fullgraph = True
++    config.compile_inference_dynamic = False
++    config.compile_frozen_parameter = True
++    config.compile_tiling_schedule_optimize = True
++
++
+ def get_safe_dtype(target_dtype, device_type):
+     """Get a safe dtype for the given device type."""
+     if device_type == "mps" and target_dtype == torch.float64:
+         return torch.float32
++    if device_type == "npu" and target_dtype == torch.float64:
++        return torch.float32
+     if device_type == "cpu":
+         # CPU doesn't support bfloat16, use float32 instead
+         if target_dtype == torch.bfloat16:
+@@ -82,6 +109,33 @@ def get_safe_dtype(target_dtype, device_type):
+     return target_dtype
+ 
+ 
++def _device_type_from_config(device: str | torch.device | None) -> str:
++    if device is None:
++        return ""
++    if isinstance(device, torch.device):
++        return device.type
++    return str(device).split(":", maxsplit=1)[0]
++
++
++def _device_supports_bfloat16(device: torch.device | str | None) -> bool:
++    device_type = _device_type_from_config(device)
++    if device_type == "npu":
++        return True
++    if device_type == "cuda":
++        return bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported())
++    return False
++
++
++def _inference_compute_precision(
++    requested_precision: Literal["bfloat16", "float32"],
++    device: str | torch.device | None,
++) -> Literal["bfloat16", "float32"]:
++    # 只在外部请求 bfloat16 且设备支持时使用 bf16；float32 请求必须保持 float32，
++    if requested_precision == "bfloat16" and _device_supports_bfloat16(device):
++        return "bfloat16"
++    return "float32"
++
++
+ def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedding` (exact copy)
+     time: torch.Tensor, dimension: int, min_period: float, max_period: float, device="cpu"
+ ) -> Tensor:
+@@ -138,18 +192,221 @@ def make_att_2d_masks(pad_masks, att_masks):  # see openpi `make_att_2d_masks` (
+ 
+     cumsum = torch.cumsum(att_masks, dim=1)
+     att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
+-    pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
++    # 保持 padding mask 为 bool，避免 TorchAir 图中产生
++    # bool -> uint8/数值 -> bool 的冗余 Cast。
++    pad_2d_masks = pad_masks[:, None, :] & pad_masks[:, :, None]
+     return att_2d_masks & pad_2d_masks
+ 
+ 
+ def clone_past_key_values(past_key_values):
+     """Clone the DynamicCache returned by prefix prefill for compiled denoising."""
+-    return DynamicCache(
+-        tuple(
+-            (keys.clone(), values.clone(), sliding_window) for keys, values, sliding_window in past_key_values
+-        )
++    if isinstance(past_key_values, dict):
++        # The optimized NPU path treats dict caches as read-only during denoise.
++        return past_key_values
++
++    # 不用 DynamicCache(tuple(...)) 复制 cache。Transformers 的构造函数
++    # 会先创建空 KV tensor，再 cat prefix KV；eager 可以处理，但 TorchAir/GE 会在
++    # Concat shape infer 中看到 [0] 与真实 KV 形状并编译失败。
++    cloned_cache = DynamicCache()
++    for keys, values, sliding_window in past_key_values:
++        layer = DynamicLayer()
++        layer.keys = keys.clone()
++        layer.values = values.clone()
++        layer.is_initialized = True
++        if sliding_window is not None:
++            layer._sliding_window_tensor = sliding_window
++        cloned_cache.layers.append(layer)
++    return cloned_cache
++
++
++# 将三维 Linear 改写为二维 进行计算。
++def _npu_graph_safe_linear_forward(linear: nn.Linear, input_tensor: torch.Tensor) -> torch.Tensor:
++    # 当前 TorchAir/GE 对三维 Linear 直接 lowering 成 MatMul 时，可能把
++    # sequence 维当成 k 轴，触发 a(seq_len) 与 b(in_features) 不一致。编译路径下
++    # 先压平成二维 MatMul，再恢复原始 batch/sequence 维度。
++    if input_tensor.ndim <= 2 or input_tensor.device.type != "npu":
++        return F.linear(input_tensor, linear.weight, linear.bias)
++
++    output_shape = (*input_tensor.shape[:-1], linear.out_features)
++    output = F.linear(
++        input_tensor.reshape(-1, input_tensor.shape[-1]),
++        linear.weight,
++        linear.bias,
++    )
++    return output.reshape(output_shape)
++
++
++def _npu_graph_safe_gemma_attention_forward(
++    module: nn.Module,
++    query: torch.Tensor,
++    key: torch.Tensor,
++    value: torch.Tensor,
++    attention_mask: torch.Tensor | None,
++    scaling: float,
++    dropout: float = 0.0,
++    **kwargs,
++):
++    # 公式保持 Transformers Gemma eager attention 不变，只把四维 matmul
++    # 改写为 GE 能稳定推断形状的三维 bmm。
++    key_states = modeling_gemma.repeat_kv(key, module.num_key_value_groups)
++    value_states = modeling_gemma.repeat_kv(value, module.num_key_value_groups)
++
++    batch_size, num_heads, query_len, head_dim = query.shape
++    key_len = key_states.shape[-2]
++    query_3d = query.reshape(batch_size * num_heads, query_len, head_dim)
++    key_3d = key_states.reshape(batch_size * num_heads, key_len, head_dim)
++    attn_weights = torch.bmm(query_3d, key_3d.transpose(1, 2)) * scaling
++    attn_weights = attn_weights.reshape(batch_size, num_heads, query_len, key_len)
++
++    if attention_mask is not None:
++        attn_weights = attn_weights + attention_mask
++
++    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
++    attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
++
++    attn_weights_3d = attn_weights.reshape(batch_size * num_heads, query_len, key_len)
++    value_3d = value_states.reshape(batch_size * num_heads, key_len, head_dim)
++    attn_output = torch.bmm(attn_weights_3d, value_3d)
++    attn_output = attn_output.reshape(batch_size, num_heads, query_len, head_dim)
++    attn_output = attn_output.transpose(1, 2).contiguous()
++    return attn_output, attn_weights
++
++
++def _npu_graph_safe_gemma_attention_module_forward(
++    attention: nn.Module,
++    hidden_states: torch.Tensor,
++    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
++    attention_mask: torch.Tensor | None = None,
++    past_key_values=None,
++    **kwargs,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    # 直接替换 GemmaAttention.forward，避免 registry 未命中时回退到
++    # Transformers 原始 eager attention 的四维 matmul。
++    input_shape = hidden_states.shape[:-1]
++    # 展开成为四维计算
++    hidden_shape = (*input_shape, -1, attention.head_dim)
++
++    query_states = attention.q_proj(hidden_states).reshape(hidden_shape).transpose(1, 2)
++    key_states = attention.k_proj(hidden_states).reshape(hidden_shape).transpose(1, 2)
++    value_states = attention.v_proj(hidden_states).reshape(hidden_shape).transpose(1, 2)
++
++    cos, sin = position_embeddings
++    query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
++        query_states,
++        key_states,
++        cos,
++        sin,
++    )
++
++    if past_key_values is not None:
++        while len(past_key_values.layers) <= attention.layer_idx:
++            past_key_values.layers.append(DynamicLayer())
++        cache_layer = past_key_values.layers[attention.layer_idx]
++        if not cache_layer.is_initialized:
++            # prefix prefill 第一次写 KV cache 时直接初始化，避免
++            # DynamicLayer.update() 里的 cat(empty, kv) 进入 GE 图。
++            cache_layer.keys = key_states
++            cache_layer.values = value_states
++            cache_layer.is_initialized = True
++        else:
++            key_states, value_states = past_key_values.update(
++                key_states,
++                value_states,
++                attention.layer_idx,
++            )
++
++    attn_output, attn_weights = _npu_graph_safe_gemma_attention_forward(
++        attention,
++        query_states,
++        key_states,
++        value_states,
++        attention_mask,
++        scaling=attention.scaling,
++        dropout=0.0 if not attention.training else attention.attention_dropout,
++        **kwargs,
+     )
+ 
++    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
++    attn_output = attention.o_proj(attn_output)
++    return attn_output, attn_weights
++
++
++def _npu_graph_safe_siglip_attention_forward(
++    module: nn.Module,
++    query: torch.Tensor,
++    key: torch.Tensor,
++    value: torch.Tensor,
++    attention_mask: torch.Tensor | None,
++    scaling: float,
++    dropout: float = 0.0,
++    **kwargs,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    # SigLIP vision tower 的 eager attention 也使用四维 matmul；
++    # prefix 图编译时同样改成 B*H 维度上的 bmm。
++    batch_size, num_heads, query_len, head_dim = query.shape
++    key_len = key.shape[-2]
++    query_3d = query.reshape(batch_size * num_heads, query_len, head_dim)
++    key_3d = key.reshape(batch_size * num_heads, key_len, head_dim)
++    attn_weights = torch.bmm(query_3d, key_3d.transpose(1, 2)) * scaling
++    attn_weights = attn_weights.reshape(batch_size, num_heads, query_len, key_len)
++
++    if attention_mask is not None:
++        attn_weights = attn_weights + attention_mask
++
++    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
++    attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
++
++    value_3d = value.reshape(batch_size * num_heads, key_len, head_dim)
++    attn_output = torch.bmm(attn_weights.reshape(batch_size * num_heads, query_len, key_len), value_3d)
++    attn_output = attn_output.reshape(batch_size, num_heads, query_len, head_dim)
++    attn_output = attn_output.transpose(1, 2).contiguous()
++    return attn_output, attn_weights
++
++
++def _npu_graph_safe_siglip_attention_module_forward(
++    attention: nn.Module,
++    hidden_states: torch.Tensor,
++    attention_mask: torch.Tensor | None = None,
++    **kwargs,
++) -> tuple[torch.Tensor, torch.Tensor | None]:
++    input_shape = hidden_states.shape[:-1]
++    hidden_shape = (*input_shape, -1, attention.head_dim)
++
++    queries = attention.q_proj(hidden_states).reshape(hidden_shape).transpose(1, 2)
++    keys = attention.k_proj(hidden_states).reshape(hidden_shape).transpose(1, 2)
++    values = attention.v_proj(hidden_states).reshape(hidden_shape).transpose(1, 2)
++
++    attn_output, attn_weights = _npu_graph_safe_siglip_attention_forward(
++        attention,
++        queries,
++        keys,
++        values,
++        attention_mask,
++        scaling=attention.scale,
++        dropout=0.0 if not attention.training else attention.dropout,
++        **kwargs,
++    )
++    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
++    attn_output = attention.out_proj(attn_output)
++    return attn_output, attn_weights
++
++
++def _npu_graph_safe_gemma_rotary_forward(
++    rotary_emb: nn.Module,
++    x: torch.Tensor,
++    position_ids: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    # Transformers GemmaRotaryEmbedding 用 [B, D/2, 1] @ [B, 1, S]
++    # 生成 RoPE 频率，TorchAir/GE 会在这个 3D MatMul 上误判 k 轴。这里改成
++    # 等价的逐元素广播乘法，输出 cos/sin 完全同形。
++    freqs = position_ids[:, :, None].to(dtype=torch.float32) * rotary_emb.inv_freq[None, None, :].to(
++        device=x.device, dtype=torch.float32
++    )
++    emb = torch.cat((freqs, freqs), dim=-1)
++    cos = emb.cos() * rotary_emb.attention_scaling
++    sin = emb.sin() * rotary_emb.attention_scaling
++    return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
++
+ 
+ def pad_vector(vector, new_dim):
+     """Pad the last dimension of a vector to new_dim with zeros.
+@@ -344,6 +601,21 @@ def get_gemma_config(variant: str) -> GemmaConfig:  # see openpi `gemma.py: get_
+         raise ValueError(f"Unknown variant: {variant}")
+ 
+ 
++def _import_torch_npu():
++    try:
++        import torch_npu  # type: ignore
++    except ModuleNotFoundError:
++        return None
++    return torch_npu
++
++
++def _is_npu_tensor_list(inputs_embeds: list[torch.Tensor | None]) -> bool:
++    for tensor in inputs_embeds:
++        if tensor is not None:
++            return tensor.device.type == "npu"
++    return False
++
++
+ class PaliGemmaWithExpertModel(
+     nn.Module
+ ):  # see openpi `gemma_pytorch.py: PaliGemmaWithExpertModel` this class is almost a exact copy of PaliGemmaWithExpertModel in openpi
+@@ -405,30 +677,41 @@ class PaliGemmaWithExpertModel(
+ 
+         self.to_bfloat16_for_selected_params(precision)
+         self._set_requires_grad()
++        self._qkv_weights_fused = False
+ 
+-    def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
++    def to_bfloat16_for_selected_params(
++        self,
++        precision: Literal["bfloat16", "float32"] = "bfloat16",
++        *,
++        vision_precision: Literal["bfloat16", "float32"] = "float32",
++    ):
+         if precision == "bfloat16":
+             self.to(dtype=torch.bfloat16)
+         elif precision == "float32":
+             self.to(dtype=torch.float32)
+-            return
+         else:
+             raise ValueError(f"Invalid precision: {precision}")
++        if vision_precision not in {"bfloat16", "float32"}:
++            raise ValueError(f"Invalid vision_precision: {vision_precision}")
+ 
+-        # Keep full vision path in float32 so we never toggle (toggle causes optimizer
+-        # "same dtype" error). Align with PI05.
++        # 默认保持完整 vision path 为 float32，与 PI05/原始路径一致；性能排查时可显式
++        # 将 vision_tower 和 multi_modal_projector 转为 bf16，验证 prefix 视觉塔是否可降精度。
+         params_to_keep_float32 = [
+-            "vision_tower",
+-            "multi_modal_projector",
+             "input_layernorm",
+             "post_attention_layernorm",
+             "model.norm",
+         ]
++        if vision_precision == "float32":
++            params_to_keep_float32.extend(["vision_tower", "multi_modal_projector"])
+ 
+         for name, param in self.named_parameters():
+             if any(selector in name for selector in params_to_keep_float32):
+                 param.data = param.data.to(dtype=torch.float32)
+ 
++        if vision_precision == "bfloat16":
++            self.paligemma.model.vision_tower.to(dtype=torch.bfloat16)
++            self.paligemma.model.multi_modal_projector.to(dtype=torch.bfloat16)
++
+     def _set_requires_grad(self):
+         if self.freeze_vision_encoder:
+             self.paligemma.model.vision_tower.eval()
+@@ -446,20 +729,314 @@ class PaliGemmaWithExpertModel(
+         if self.train_expert_only:
+             self.paligemma.eval()
+ 
++    @torch.no_grad()
++    def fuse_qkv_weights(self):
++        """Create fused qkv Linear layers used by the Ascend NPU attention path."""
++        if self._qkv_weights_fused:
++            return
++
++        # NPU 融合 attention 路径需要一次 qkv 投影，提前把 q/k/v 三个 Linear
++        # 的权重拼接成只读 qkv Linear，避免推理时反复执行三个独立 matmul。
++        for model in (self.paligemma.model.language_model, self.gemma_expert.model):
++            for layer in model.layers:
++                attn = layer.self_attn
++                qkv_weight = torch.cat(
++                    [attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight],
++                    dim=0,
++                ).contiguous()
++                attn.qkv = nn.Linear(
++                    qkv_weight.shape[1],
++                    qkv_weight.shape[0],
++                    bias=False,
++                    device=qkv_weight.device,
++                    dtype=qkv_weight.dtype,
++                )
++                attn.qkv.weight.copy_(qkv_weight)
++                attn.qkv.weight.requires_grad_(False)
++
++        self._qkv_weights_fused = True
++
++    def _prepare_vision_pixels(self, image: torch.Tensor) -> torch.Tensor:
++        # image dtype 跟随 vision tower 权重。推理精度由 PI0Config.dtype 统一控制，
++        # 输入图像也转成相同 dtype，避免 prefix 视觉塔内部反复 cast。
++        vision_dtype = next(self.paligemma.model.vision_tower.parameters()).dtype
++        if image.dtype != vision_dtype:
++            return image.to(vision_dtype)
++        return image
++
++    def embed_image_vision_tower(self, image: torch.Tensor) -> torch.Tensor:
++        image = self._prepare_vision_pixels(image)
++        image_outputs = self.paligemma.model.vision_tower(image)
++        return image_outputs.last_hidden_state
++
++    def embed_image_projector(self, image_features: torch.Tensor) -> torch.Tensor:
++        return self.paligemma.model.multi_modal_projector(image_features)
++
+     def embed_image(self, image: torch.Tensor):
+-        # Vision tower and multi_modal_projector are kept in float32 (params_to_keep_float32). Align with PI05.
+-        out_dtype = image.dtype
+-        if image.dtype != torch.float32:
+-            image = image.to(torch.float32)
+-        image_outputs = self.paligemma.model.get_image_features(image)
+-        features = image_outputs.pooler_output
+-        if features.dtype != out_dtype:
+-            features = features.to(out_dtype)
+-        return features
++        # 本地展开 transformers PaliGemmaModel.get_image_features 的薄 wrapper，
++        # 便于后续单独优化/分析 SigLIP vision_tower 和 multi_modal_projector。
++        image_features = self.embed_image_vision_tower(image)
++        return self.embed_image_projector(image_features)
+ 
+     def embed_language_tokens(self, tokens: torch.Tensor):
+         return self.paligemma.model.language_model.get_input_embeddings()(tokens)
+ 
++    def prepare_vision_tower_npu_fused_ops(self) -> dict[str, Any]:
++        """Replace the Transformers SigLIP tower with the shared NPU implementation."""
++        old_vision_tower = self.paligemma.model.vision_tower
++        replaced = False
++        if isinstance(old_vision_tower, PI0SiglipVisionModel):
++            vision_tower = old_vision_tower
++        else:
++            first_param = next(old_vision_tower.parameters())
++            device = first_param.device
++            dtype = first_param.dtype
++            training = old_vision_tower.training
++            requires_grad_by_name = {
++                name: param.requires_grad for name, param in old_vision_tower.named_parameters()
++            }
++
++            # PI0/PI0.5 的 SigLIP state_dict 路径一致。先按旧塔的
++            # device/dtype 构建本地实现，再 strict 加载，确保替换不改变权重语义。
++            vision_tower = PI0SiglipVisionModel(old_vision_tower.config)
++            vision_tower.to(device=device, dtype=dtype)
++            vision_tower.load_state_dict(old_vision_tower.state_dict(), strict=True)
++            for name, param in vision_tower.named_parameters():
++                if name in requires_grad_by_name:
++                    param.requires_grad_(requires_grad_by_name[name])
++            vision_tower.train(training)
++            self.paligemma.model.vision_tower = vision_tower
++            replaced = True
++
++        # 视觉塔每层把 q/k/v 三次投影拼为一次 Linear，并在 NPU
++        # 推理态使用 BSND PFA；CPU/CUDA 或训练态仍自动回退等价 eager attention。
++        vision_tower.fuse_qkv_weights()
++        vision_tower.enable_npu_pfa(True)
++        return {
++            "local_siglip_vision_tower": True,
++            "replaced_transformers_vision_tower": replaced,
++            "attention": "torch_npu.npu_prompt_flash_attention",
++            "qkv_weights_fused": True,
++        }
++
++    def should_enable_vision_tower_npu_fused_ops(self, *, default: bool = True) -> bool:
++        """Read the optional environment override for the fixed PI0 vision path."""
++        raw_value = os.environ.get(PI0_ENABLE_VISION_NPU_PFA_ENV)
++        if raw_value is None or raw_value.strip() == "":
++            return bool(default)
++        value = raw_value.strip().lower()
++        if value in {"1", "true", "yes", "on"}:
++            return True
++        if value in {"0", "false", "no", "off"}:
++            return False
++        raise ValueError(f"{PI0_ENABLE_VISION_NPU_PFA_ENV} must be a boolean-like value, got {value!r}")
++
++    def _can_use_npu_fused_inference(
++        self,
++        attention_mask: torch.Tensor | None,
++        position_ids: torch.LongTensor | None,
++        inputs_embeds: list[torch.FloatTensor] | None,
++        adarms_cond: list[torch.Tensor] | None,
++    ) -> bool:
++        # 融合算子路径只在 NPU 推理态生效；训练、CPU/CUDA、AdaRMS 条件分支
++        # 或 qkv 权重尚未融合时都回退到原始 eager 路径，保证行为兼容。
++        if self.training or attention_mask is None or position_ids is None:
++            return False
++        if inputs_embeds is None or not _is_npu_tensor_list(inputs_embeds):
++            return False
++        if any(
++            embed is not None and embed.dtype not in (torch.bfloat16, torch.float16)
++            for embed in inputs_embeds
++        ):
++            return False
++        if _import_torch_npu() is None:
++            return False
++        if adarms_cond is not None and any(cond is not None for cond in adarms_cond):
++            return False
++        return self._qkv_weights_fused
++
++    def _npu_attention_mask(self, attention_mask: torch.Tensor) -> torch.Tensor:
++        # PFA 算子使用 int8 阻塞 mask，这里把 LeRobot/Gemma 的 4D additive
++        # mask 或 bool mask 统一转换成 NPU 算子需要的连续内存格式。
++        if attention_mask.dtype == torch.bool:
++            blocked_mask = torch.logical_not(attention_mask)
++        else:
++            blocked_mask = attention_mask < 0
++        if blocked_mask.ndim == 3:
++            blocked_mask = blocked_mask[:, None, :, :]
++        return blocked_mask.to(dtype=torch.int8, memory_format=torch.contiguous_format)
++
++    def _build_npu_rotary_cache(
++        self,
++        position_ids: torch.LongTensor,
++        head_dim: int,
++        dtype: torch.dtype,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        # RoPE 的 cos/sin 只依赖 position_ids、head_dim、dtype 和 device。
++        # prefix/denoise 单次 forward 内每层使用同一组位置编码，提前构造后在层循环中复用，
++        # 避免每层重复执行 arange/pow/cos/sin/cat/to 等图内算子。
++        d_half = head_dim // 2
++        freq_exponents = (2.0 / head_dim) * torch.arange(
++            d_half, dtype=torch.float32, device=position_ids.device
++        )
++        timescale = 10_000**freq_exponents
++        radians = position_ids[..., None].to(torch.float32) / timescale[None, None, :]
++        radians = radians[..., None, :]
++        cos = torch.cat([torch.cos(radians), torch.cos(radians)], dim=-1)
++        sin = torch.cat([torch.sin(radians), torch.sin(radians)], dim=-1)
++        return cos.to(dtype=dtype), sin.to(dtype=dtype)
++
++    def _npu_rotary_emb(
++        self,
++        torch_npu,
++        query_states: torch.Tensor,
++        key_states: torch.Tensor,
++        cos: torch.Tensor,
++        sin: torch.Tensor,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        # 使用 torch_npu.npu_rotary_mul 执行 RoPE，减少 Python 层拆分/拼接和
++        # 通用 aten 算子数量；q/k 合并后一次调用，再按头数切回。
++        num_q_heads = query_states.shape[2]
++        num_kv_heads = key_states.shape[2]
++        merged_states = torch.cat([query_states, key_states], dim=2)
++        merged_states = torch_npu.npu_rotary_mul(merged_states, cos, sin)
++        return merged_states.split([num_q_heads, num_kv_heads], dim=2)
++
++    def _npu_rms_norm(self, torch_npu, layernorm, hidden_states: torch.Tensor) -> torch.Tensor:
++        # Gemma RMSNorm 的有效权重是 1 + weight，直接调用 NPU RMSNorm 融合算子。
++        # NPU 融合 RMSNorm 要求 gamma 与输入 dtype 一致；模型本体仍保留 FP32 norm 权重以保证
++        # eager/训练路径精度，这里只对传入融合算子的临时 gamma 做 dtype 对齐。
++        norm_weight = layernorm.weight.add(1.0).to(dtype=hidden_states.dtype)
++        return torch_npu.npu_rms_norm(hidden_states, norm_weight, layernorm.eps)[0]
++
++    def _forward_npu_optimized(
++        self,
++        attention_mask: torch.Tensor,
++        position_ids: torch.LongTensor,
++        past_key_values: dict | None,
++        inputs_embeds: list[torch.FloatTensor],
++        use_cache: bool | None,
++    ):
++        # 这是 Ascend NPU 推理专用融合路径，将每层的 RMSNorm、QKV、RoPE、
++        # Prompt Flash Attention、Add+RMSNorm 尽量替换为 torch_npu 融合算子。
++        torch_npu = _import_torch_npu()
++        if torch_npu is None:
++            raise RuntimeError("torch_npu is required for PI0 NPU fused inference")
++
++        npu_attention_mask = self._npu_attention_mask(attention_mask)
++        active_models = [
++            (0, self.paligemma.model.language_model, inputs_embeds[0]),
++            (1, self.gemma_expert.model, inputs_embeds[1]),
++        ]
++        active_models = [(idx, model, embeds) for idx, model, embeds in active_models if embeds is not None]
++
++        num_layers = self.paligemma.config.text_config.num_hidden_layers
++        outputs_by_index: list[torch.Tensor | None] = [inputs_embeds[0], inputs_embeds[1]]
++        prefix_past_key_values = past_key_values
++        if use_cache and prefix_past_key_values is None:
++            prefix_past_key_values = {}
++
++        attention_model = active_models[0][1]
++        first_attn = attention_model.layers[0].self_attn
++        attention_head_dim = first_attn.head_dim
++        attention_num_heads = attention_model.config.num_attention_heads
++        attention_num_kv_heads = attention_model.config.num_key_value_heads
++        attention_scale_value = 1.0 / math.sqrt(attention_head_dim)
++        rotary_cos, rotary_sin = self._build_npu_rotary_cache(
++            position_ids,
++            attention_head_dim,
++            first_attn.qkv.weight.dtype,
++        )
++
++        for layer_idx in range(num_layers):
++            # pi0 同一层会同时处理 PaliGemma prefix 和 action expert suffix。
++            # 先分别做 RMSNorm+fused QKV，再把两个序列拼成一次 attention 调用。
++            query_states_parts = []
++            key_states_parts = []
++            value_states_parts = []
++
++            for model_idx, model, hidden_states in active_models:
++                layer = model.layers[layer_idx]
++                attn = layer.self_attn
++                residual = hidden_states.to(dtype=attn.qkv.weight.dtype)
++                hidden_states = self._npu_rms_norm(torch_npu, layer.input_layernorm, residual)
++
++                hidden_shape = (*hidden_states.shape[:-1], -1, attention_head_dim)
++                num_heads = model.config.num_attention_heads
++                num_kv_heads = model.config.num_key_value_heads
++                q_out = num_heads * attention_head_dim
++                kv_out = num_kv_heads * attention_head_dim
++
++                qkv = attn.qkv(hidden_states)
++                query_states, key_states, value_states = qkv.split([q_out, kv_out, kv_out], dim=-1)
++                query_states_parts.append(query_states.view(hidden_shape))
++                key_states_parts.append(key_states.view(hidden_shape))
++                value_states_parts.append(value_states.view(hidden_shape))
++                outputs_by_index[model_idx] = residual
++
++            query_states = torch.cat(query_states_parts, dim=1)
++            key_states = torch.cat(key_states_parts, dim=1)
++            value_states = torch.cat(value_states_parts, dim=1)
++
++            query_states, key_states = self._npu_rotary_emb(
++                torch_npu, query_states, key_states, rotary_cos, rotary_sin
++            )
++
++            # prefix prefill 阶段写入 KV cache；denoise 阶段复用 prefix cache，
++            # 只拼接 suffix 的 KV，避免每个 denoise step 重复计算视觉/语言 prefix。
++            if use_cache and len(active_models) == 1 and active_models[0][0] == 0:
++                prefix_past_key_values[layer_idx] = {
++                    "key_states": key_states,
++                    "value_states": value_states,
++                }
++            elif past_key_values is not None:
++                key_states = torch.cat([past_key_values[layer_idx]["key_states"], key_states], dim=1)
++                value_states = torch.cat([past_key_values[layer_idx]["value_states"], value_states], dim=1)
++
++            batch_size = query_states.shape[0]
++            # PFA 以 BSND 布局接收 q/k/v，并直接消费上面生成的阻塞 mask。
++            att_output = torch_npu.npu_prompt_flash_attention(
++                query_states,
++                key_states.contiguous(),
++                value_states.contiguous(),
++                num_heads=attention_num_heads,
++                input_layout="BSND",
++                scale_value=attention_scale_value,
++                pre_tokens=65535,
++                next_tokens=65535,
++                atten_mask=npu_attention_mask,
++                num_key_value_heads=attention_num_kv_heads,
++            )
++            att_output = att_output.reshape(batch_size, -1, attention_num_heads * attention_head_dim)
++
++            next_active_models = []
++            start = 0
++            for model_idx, model, hidden_states in active_models:
++                layer = model.layers[layer_idx]
++                end = start + hidden_states.shape[1]
++                out_emb = layer.self_attn.o_proj(att_output[:, start:end])
++                norm_weight = layer.post_attention_layernorm.weight.add(1.0).to(dtype=out_emb.dtype)
++                # attention 输出投影后立即做残差加和与 RMSNorm，使用
++                # npu_add_rms_norm 减少一次写回和一次独立 norm 调用。
++                out_emb, _, after_first_residual = torch_npu.npu_add_rms_norm(
++                    out_emb,
++                    hidden_states.to(out_emb.dtype),
++                    norm_weight,
++                    layer.post_attention_layernorm.eps,
++                )
++                # 前馈神经网络层，对注意力输出进行非线性变换
++                out_emb = layer.mlp(out_emb)
++                out_emb = out_emb + after_first_residual
++                outputs_by_index[model_idx] = out_emb
++                next_active_models.append((model_idx, model, out_emb))
++                start = end
++            active_models = next_active_models
++
++        for model_idx, model, hidden_states in active_models:
++            outputs_by_index[model_idx] = self._npu_rms_norm(torch_npu, model.norm, hidden_states)
++
++        return outputs_by_index, prefix_past_key_values if use_cache else None
++
+     def forward(
+         self,
+         attention_mask: torch.Tensor | None = None,
+@@ -471,6 +1048,15 @@ class PaliGemmaWithExpertModel(
+     ):
+         if adarms_cond is None:
+             adarms_cond = [None, None]
++        if self._can_use_npu_fused_inference(attention_mask, position_ids, inputs_embeds, adarms_cond):
++            # 满足 NPU 融合条件时走优化路径，否则继续使用原始 HuggingFace/Gemma forward。
++            return self._forward_npu_optimized(
++                attention_mask=attention_mask,
++                position_ids=position_ids,
++                past_key_values=past_key_values,
++                inputs_embeds=inputs_embeds,
++                use_cache=use_cache,
++            )
+         if inputs_embeds[1] is None:
+             prefix_output = self.paligemma.model.language_model.forward(
+                 inputs_embeds=inputs_embeds[0],
+@@ -583,7 +1169,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
+             paligemma_config,
+             action_expert_config,
+             use_adarms=[False, False],
+-            precision=config.dtype,
++            precision=_inference_compute_precision(config.dtype, config.device),
+             image_size=config.image_resolution[0],
+             freeze_vision_encoder=config.freeze_vision_encoder,
+             train_expert_only=config.train_expert_only,
+@@ -595,17 +1181,194 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
+         self.state_proj = nn.Linear(config.max_state_dim, action_expert_config.width)
+         self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
+         self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
++        if action_expert_config.width % 2 != 0:
++            raise ValueError(f"Action expert width must be even, got {action_expert_config.width}")
++        time_fraction = torch.linspace(0.0, 1.0, action_expert_config.width // 2, dtype=torch.float32)
++        time_period = config.min_period * (config.max_period / config.min_period) ** time_fraction
++        # sinusoidal time embedding 的频率只依赖模型配置，预先注册成 buffer。
++        # 这样 denoise 编译图里不再捕获 linspace/pow 等动态构造，规避 TorchDynamo+TorchAir
++        # 在 NPU trace 时的 TypeError([])。
++        self.register_buffer(
++            "_action_time_scaling_factor",
++            1.0 / time_period * 2 * math.pi,
++            persistent=False,
++        )
++        self.register_buffer("_action_denoise_dt", torch.empty(0, dtype=torch.float32), persistent=False)
++        self.register_buffer(
++            "_action_denoise_timestep_table",
++            torch.empty(0, dtype=torch.float32),
++            persistent=False,
++        )
++        self.register_buffer(
++            "_action_denoise_time_embedding_table",
++            torch.empty(0, dtype=torch.float32),
++            persistent=False,
++        )
++        self.register_buffer(
++            "_action_denoise_suffix_position_ids",
++            torch.empty(0, dtype=torch.int64),
++            persistent=False,
++        )
++        self.register_buffer(
++            "_action_time_mlp_in_action_weight",
++            torch.empty(0, dtype=torch.float32),
++            persistent=False,
++        )
++        self.register_buffer(
++            "_action_denoise_time_mlp_in_bias_table",
++            torch.empty(0, dtype=torch.float32),
++            persistent=False,
++        )
+ 
+         # Initialize gradient checkpointing flag
+         self.gradient_checkpointing_enabled = False
++        self._sample_actions_graph_compile_enabled = False
++        self._compiled_action_prefix_forward = None
++        self._compiled_action_denoise_step = None
++        self._compiled_action_denoise_10_steps = None
++        self._sample_actions_graph_compile_info: dict[str, Any] = {}
+ 
+         # Compile model if requested
+         if config.compile_model:
+             torch.set_float32_matmul_precision("high")
+-            self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
++            if not config.compile_inference_graph:
++                self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
+             # Also compile the main forward pass used during training
+             self.forward = torch.compile(self.forward, mode=config.compile_mode)
+ 
++    def prepare_inference_optimizations(self) -> dict[str, Any]:
++        """Finalize optional inference optimizations after weights are loaded."""
++        # 推理优化必须在权重加载和 device placement 之后执行；
++        # 此时 qkv 权重 dtype/device 已确定，torch.compile 也能捕获最终设备上的图。
++        self._prepare_action_compute_dtype()
++        self._refresh_fixed_denoise_lookup_tables()
++        self.paligemma_with_expert.fuse_qkv_weights()
++        vision_optimization_info = {
++            "local_siglip_vision_tower": isinstance(
++                self.paligemma_with_expert.paligemma.model.vision_tower,
++                PI0SiglipVisionModel,
++            ),
++            "enabled": False,
++            "default_enabled": True,
++            "enable_env": PI0_ENABLE_VISION_NPU_PFA_ENV,
++            "attention": "transformers_default",
++            "qkv_weights_fused": False,
++        }
++        if (
++            self.config.compile_inference_graph
++            and self.paligemma_with_expert.should_enable_vision_tower_npu_fused_ops(default=True)
++        ):
++            vision_optimization_info = self.paligemma_with_expert.prepare_vision_tower_npu_fused_ops()
++            vision_optimization_info["enabled"] = True
++            vision_optimization_info["default_enabled"] = True
++            vision_optimization_info["enable_env"] = PI0_ENABLE_VISION_NPU_PFA_ENV
++        if self.config.compile_inference_graph and not self._sample_actions_graph_compile_enabled:
++            self.enable_sample_actions_graph_compile()
++        return {
++            "qkv_weights_fused": self.paligemma_with_expert._qkv_weights_fused,
++            "action_compute_dtype": str(self._action_compute_dtype()),
++            "vision_compute_dtype": str(self._vision_compute_dtype()),
++            "fixed_denoise_lookup_tables": self._fixed_denoise_lookup_tables_info(),
++            "graph_compile": dict(self._sample_actions_graph_compile_info),
++            "vision_tower_npu_fused_ops": vision_optimization_info,
++        }
++
++    def _action_compute_dtype(self, device: torch.device | str | None = None) -> torch.dtype:
++        # prefix/denoise 推理精度由 config.dtype 统一控制；请求 bf16 但设备不支持时回退 float32。
++        target_device = device
++        if target_device is None:
++            try:
++                target_device = next(self.parameters()).device
++            except StopIteration:
++                target_device = self.config.device
++        requested = getattr(self.config, "dtype", "bfloat16")
++        if requested == "bfloat16" and _device_supports_bfloat16(target_device):
++            return torch.bfloat16
++        return torch.float32
++
++    def _cast_action_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
++        target_dtype = self._action_compute_dtype(tensor.device)
++        if tensor.dtype.is_floating_point and tensor.dtype != target_dtype:
++            return tensor.to(dtype=target_dtype)
++        return tensor
++
++    def _fixed_denoise_lookup_tables_info(self) -> dict[str, Any]:
++        return {
++            "denoise_steps": PI0_GRAPH_DENOISE_STEPS,
++            "dt_shape": list(self._action_denoise_dt.shape),
++            "timestep_table_shape": list(self._action_denoise_timestep_table.shape),
++            "time_embedding_table_shape": list(self._action_denoise_time_embedding_table.shape),
++            "suffix_position_ids_shape": list(self._action_denoise_suffix_position_ids.shape),
++            "time_mlp_in_action_weight_shape": list(self._action_time_mlp_in_action_weight.shape),
++            "time_mlp_in_bias_table_shape": list(self._action_denoise_time_mlp_in_bias_table.shape),
++            "dtype": str(self._action_denoise_time_mlp_in_bias_table.dtype),
++            "device": str(self._action_denoise_time_mlp_in_bias_table.device),
++        }
++
++    @torch.no_grad()
++    def _refresh_fixed_denoise_lookup_tables(self) -> None:
++        """Precompute fixed 10-step denoise timestep tables used by graph inference."""
++        device = self.action_time_mlp_in.weight.device
++        target_dtype = self._action_compute_dtype(device)
++        timestep_table_f32 = (
++            1.0
++            - torch.arange(
++                PI0_GRAPH_DENOISE_STEPS,
++                dtype=torch.float32,
++                device=device,
++            )
++            / PI0_GRAPH_DENOISE_STEPS
++        )
++        time_embedding_f32 = self._create_action_time_embedding(timestep_table_f32)
++
++        action_width = self.action_in_proj.out_features
++        action_weight = self.action_time_mlp_in.weight[:, :action_width].contiguous()
++        time_weight = self.action_time_mlp_in.weight[:, action_width:].contiguous()
++        time_embedding = time_embedding_f32.to(dtype=time_weight.dtype)
++        time_mlp_in_bias = F.linear(time_embedding, time_weight, self.action_time_mlp_in.bias).contiguous()
++
++        self._action_denoise_dt = torch.tensor(
++            -1.0 / PI0_GRAPH_DENOISE_STEPS,
++            dtype=target_dtype,
++            device=device,
++        )
++        self._action_denoise_timestep_table = timestep_table_f32.to(dtype=target_dtype)
++        self._action_denoise_time_embedding_table = time_embedding_f32.to(dtype=target_dtype)
++        self._action_denoise_suffix_position_ids = torch.arange(
++            self.config.chunk_size + 1,
++            dtype=torch.int64,
++            device=device,
++        )
++        self._action_time_mlp_in_action_weight = action_weight
++        self._action_denoise_time_mlp_in_bias_table = time_mlp_in_bias
++
++    def _vision_compute_dtype(self) -> torch.dtype:
++        return self._action_compute_dtype()
++
++    def _prepare_action_compute_dtype(self) -> None:
++        target_dtype = self._action_compute_dtype()
++        precision: Literal["bfloat16", "float32"] = (
++            "bfloat16" if target_dtype == torch.bfloat16 else "float32"
++        )
++        vision_precision: Literal["bfloat16", "float32"] = (
++            "bfloat16" if self._vision_compute_dtype() == torch.bfloat16 else "float32"
++        )
++        # 权重加载和 policy.to(device) 完成后，根据 dtype 统一选择推理精度；
++        # 不再为视觉塔提供独立精度开关，避免优化路径多出第三个维度。
++        self.paligemma_with_expert.to_bfloat16_for_selected_params(
++            precision,
++            vision_precision=vision_precision,
++        )
++        modules = [
++            self.state_proj,
++            self.action_in_proj,
++            self.action_time_mlp_in,
++            self.action_time_mlp_out,
++            self.action_out_proj,
++        ]
++        for module in modules:
++            module.to(dtype=target_dtype)
++
+     def gradient_checkpointing_enable(self):
+         """Enable gradient checkpointing for memory optimization."""
+         self.gradient_checkpointing_enabled = True
+@@ -638,14 +1401,315 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
+         att_2d_masks_4d = att_2d_masks[:, None, :, :]
+         return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
+ 
++    def _create_action_time_embedding(self, timestep: torch.Tensor) -> torch.Tensor:
++        # 频率 buffer 会随 model.to(device) 自动移动；这里只做逐步 timestep 的
++        # sin/cos 计算，保留与 OpenPI 相同的时间编码公式。
++        sin_input = self._action_time_scaling_factor[None, :] * timestep[:, None].to(
++            dtype=self._action_time_scaling_factor.dtype
++        )
++        time_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
++        return time_emb.to(dtype=timestep.dtype)
++
++    def _force_eager_attention_for_graph_compile(self) -> None:
++        """Force eager attention kernels before TorchAir graph capture."""
++        # torch_npu 会把 Transformers 的 SDPA attention lower 成
++        # npu_fusion_attention_v3；当前 TorchAir 环境缺少该算子的 AscendIR converter。
++        # 图编译前强制视觉塔走 eager；Gemma 子模块走 bmm 版 eager attention，
++        # 避免捕获 SDPA，也避免 GE 编译四维 matmul 时 shape infer 失败。
++        try:
++            from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
++        except Exception:
++            ALL_ATTENTION_FUNCTIONS = None
++        if ALL_ATTENTION_FUNCTIONS is not None:
++            ALL_ATTENTION_FUNCTIONS.register("eager_bmm", _npu_graph_safe_gemma_attention_forward)
++        gemma_attention_functions = getattr(modeling_gemma, "ALL_ATTENTION_FUNCTIONS", None)
++        if gemma_attention_functions is not None:
++            gemma_attention_functions.register("eager_bmm", _npu_graph_safe_gemma_attention_forward)
++
++        modules = [
++            self.paligemma_with_expert.paligemma,
++            self.paligemma_with_expert.paligemma.model.vision_tower,
++        ]
++        for module in modules:
++            config = getattr(module, "config", None)
++            if config is not None and hasattr(config, "_attn_implementation"):
++                config._attn_implementation = "eager"
++
++        gemma_modules = [
++            self.paligemma_with_expert.paligemma.model.language_model,
++            self.paligemma_with_expert.gemma_expert.model,
++        ]
++        for module in gemma_modules:
++            config = getattr(module, "config", None)
++            if config is not None and hasattr(config, "_attn_implementation"):
++                config._attn_implementation = "eager_bmm"
++
++    def _patch_linear_for_npu_graph_compile(self) -> None:
++        # TorchAir/GE 当前对 rank>2 的 Linear/MatMul shape infer 不稳定；
++        # graph 模式下给所有 Linear 换成“二维 matmul + reshape”实现，权重和数值保持不变。
++        for module in self.modules():
++            if isinstance(module, nn.Linear) and not getattr(module, "_pi0_graph_safe_linear", False):
++                module.forward = types.MethodType(_npu_graph_safe_linear_forward, module)
++                module._pi0_graph_safe_linear = True
++
++    def _patch_gemma_attention_for_npu_graph_compile(self) -> None:
++        # Gemma eager attention 原实现包含四维 torch.matmul，TorchAir/GE
++        # 会错误推断 k 轴。这里直接 patch GemmaAttention.forward 为 bmm 版本。
++        gemma_attention_cls = getattr(modeling_gemma, "GemmaAttention", None)
++        if gemma_attention_cls is None:
++            return
++        for module in self.modules():
++            if isinstance(module, gemma_attention_cls) and not getattr(
++                module, "_pi0_graph_safe_attention", False
++            ):
++                module.forward = types.MethodType(_npu_graph_safe_gemma_attention_module_forward, module)
++                module._pi0_graph_safe_attention = True
++
++    def _patch_siglip_attention_for_npu_graph_compile(self) -> None:
++        # 只有显式编译 prefix 时才会捕获 SigLIP vision tower；
++        # 其 eager attention 同样需要 bmm 化以避开四维 MatMul shape infer。
++        try:
++            from transformers.models.siglip.modeling_siglip import SiglipAttention
++        except Exception:
++            return
++        for module in self.modules():
++            if isinstance(module, SiglipAttention) and not getattr(
++                module, "_pi0_graph_safe_attention", False
++            ):
++                module.forward = types.MethodType(_npu_graph_safe_siglip_attention_module_forward, module)
++                module._pi0_graph_safe_attention = True
++
++    def _patch_gemma_rotary_for_npu_graph_compile(self) -> None:
++        # RoPE 原实现用小型 batch matmul 生成频率，GE shape infer 不稳定；
++        # graph 模式下替换为广播乘法。
++        rotary_cls = getattr(modeling_gemma, "GemmaRotaryEmbedding", None)
++        if rotary_cls is None:
++            return
++        for module in self.modules():
++            if isinstance(module, rotary_cls) and not getattr(module, "_pi0_graph_safe_rotary", False):
++                module.forward = types.MethodType(_npu_graph_safe_gemma_rotary_forward, module)
++                module._pi0_graph_safe_rotary = True
++
++    def enable_sample_actions_graph_compile(
++        self,
++        *,
++        backend=None,
++        fullgraph: bool | None = None,
++        dynamic: bool | None = None,
++        frozen_parameter: bool | None = None,
++        tiling_schedule_optimize: bool | None = None,
++    ) -> dict[str, Any]:
++        """Compile pi0 inference fragments used by action sampling."""
++        # pi0 推理由一次 prefix prefill 和固定 10 步 denoise 组成。
++        # denoise 10 步整体编译为一张图，减少 Python 调度和单步图重复提交开销；
++        # prefix 阶段单独编译，避免把 prefix 与 denoise 强行合成单大图。
++        if not hasattr(torch, "compile"):
++            raise RuntimeError("torch.compile is not available in this PyTorch build")
++        self._force_eager_attention_for_graph_compile()
++        if next(self.parameters()).device.type == "npu":
++            self._patch_linear_for_npu_graph_compile()
++            self._patch_gemma_attention_for_npu_graph_compile()
++            self._patch_siglip_attention_for_npu_graph_compile()
++            self._patch_gemma_rotary_for_npu_graph_compile()
++
++        fullgraph = self.config.compile_inference_fullgraph if fullgraph is None else fullgraph
++        dynamic = self.config.compile_inference_dynamic if dynamic is None else dynamic
++        frozen_parameter = (
++            self.config.compile_frozen_parameter if frozen_parameter is None else frozen_parameter
++        )
++        tiling_schedule_optimize = (
++            self.config.compile_tiling_schedule_optimize
++            if tiling_schedule_optimize is None
++            else tiling_schedule_optimize
++        )
++
++        compile_kwargs, backend_name = self._build_inference_compile_kwargs(
++            backend=backend,
++            fullgraph=fullgraph,
++            dynamic=dynamic,
++            frozen_parameter=frozen_parameter,
++            tiling_schedule_optimize=tiling_schedule_optimize,
++        )
++
++        self._compiled_action_prefix_forward = torch.compile(
++            self._action_prefix_forward_for_compile,
++            **compile_kwargs,
++        )
++
++        # denoise 图固定展开 10 步 Euler 更新，并整体编译为一张图。
++        # 这样 Python 不再在 denoise step 之间往返调度，TorchAir/GE 可以看到完整采样子图。
++        self._compiled_action_denoise_10_steps = torch.compile(
++            self._action_denoise_10_steps_for_compile,
++            **compile_kwargs,
++        )
++        self._sample_actions_graph_compile_enabled = True
++        self._sample_actions_graph_compile_info = {
++            "enabled": True,
++            "backend": backend_name,
++            "dynamic": dynamic,
++            "fullgraph": fullgraph,
++            "graph_path": "split_prefix_denoise",
++            "prefix_compiled": True,
++            "denoise_steps": PI0_GRAPH_DENOISE_STEPS,
++            "denoise_compilation": "single_graph",
++            "frozen_parameter": frozen_parameter,
++            "tiling_schedule_optimize": tiling_schedule_optimize,
++            "targets": ["_action_prefix_forward_for_compile", "_action_denoise_10_steps_for_compile"],
++        }
++        return dict(self._sample_actions_graph_compile_info)
++
++    def _build_inference_compile_kwargs(
++        self,
++        *,
++        backend=None,
++        fullgraph: bool | None = None,
++        dynamic: bool | None = None,
++        frozen_parameter: bool | None = None,
++        tiling_schedule_optimize: bool | None = None,
++    ) -> tuple[dict[str, Any], str]:
++        """Build torch.compile kwargs for PI0 inference graphs.
++
++        完整推理编译和 prefix 分阶段配置必须使用同一组 backend
++        与 TorchAir/npugraph_ex 选项，确保两条推理路径的行为一致。
++        """
++        fullgraph = self.config.compile_inference_fullgraph if fullgraph is None else fullgraph
++        dynamic = self.config.compile_inference_dynamic if dynamic is None else dynamic
++        frozen_parameter = (
++            self.config.compile_frozen_parameter if frozen_parameter is None else frozen_parameter
++        )
++        tiling_schedule_optimize = (
++            self.config.compile_tiling_schedule_optimize
++            if tiling_schedule_optimize is None
++            else tiling_schedule_optimize
++        )
++
++        compile_kwargs: dict[str, Any] = {"dynamic": dynamic, "fullgraph": fullgraph}
++        backend_name = self.config.compile_inference_backend or "auto"
++
++        if backend is None:
++            device_type = next(self.parameters()).device.type
++            if backend_name in {None, "auto"}:
++                if device_type == "npu":
++                    # NPU 默认选择 TorchAir/GE backend，走 Ascend 图编译链路。
++                    backend = self._build_torchair_backend(
++                        frozen_parameter=frozen_parameter,
++                        tiling_schedule_optimize=tiling_schedule_optimize,
++                    )
++                    backend_name = "torchair"
++                else:
++                    compile_kwargs["mode"] = self.config.compile_mode
++                    backend_name = "inductor"
++            elif backend_name == "torchair":
++                backend = self._build_torchair_backend(
++                    frozen_parameter=frozen_parameter,
++                    tiling_schedule_optimize=tiling_schedule_optimize,
++                )
++            elif backend_name == "npugraph_ex":
++                # npugraph_ex 是 torch_npu 注册的另一条 NPU 图编译后端。
++                # 与 TorchAir/GE 路径并存，通过 compile_inference_backend 显式选择。
++                backend = self._build_npugraph_ex_backend()
++            elif backend_name == "inductor":
++                compile_kwargs["mode"] = self.config.compile_mode
++            else:
++                backend = backend_name
++        else:
++            backend_name = type(backend).__name__
++
++        if backend is not None:
++            compile_kwargs["backend"] = backend
++        return compile_kwargs, backend_name
++
++    def _build_npugraph_ex_backend(self):
++        """Build torch_npu npugraph_ex backend without changing existing TorchAir path."""
++        try:
++            import torch_npu  # noqa: F401
++        except ModuleNotFoundError as exc:
++            raise RuntimeError("npugraph_ex backend requires torch_npu") from exc
++
++        try:
++            import npugraph_ex  # type: ignore
++        except ModuleNotFoundError:
++            try:
++                from torch_npu.dynamo import npugraph_ex  # type: ignore
++            except Exception as exc:
++                raise RuntimeError("npugraph_ex backend requires torch_npu.dynamo.npugraph_ex") from exc
++            sys.modules.setdefault("npugraph_ex", npugraph_ex)
++
++        config_cls = getattr(npugraph_ex, "CompilerConfig", None)
++        if config_cls is None:
++            from npugraph_ex.configs.compiler_config import CompilerConfig as config_cls  # type: ignore
++
++        compiler_config = config_cls()
++        if hasattr(compiler_config, "mode"):
++            compiler_config.mode = "npugraph_ex"
++        return npugraph_ex.get_npu_backend(compiler_config=compiler_config)
++
++    def _build_torchair_backend(
++        self,
++        *,
++        frozen_parameter: bool = True,
++        tiling_schedule_optimize: bool = True,
++    ):
++        # TorchAir 可能以独立 torchair 包存在，也可能随 torch_npu.dynamo 发布。
++        # 两种导入路径都兼容，便于不同 CANN/PyTorch-NPU 版本复用。
++        try:
++            import torch_npu  # noqa: F401
++        except ModuleNotFoundError as exc:
++            raise RuntimeError("TorchAir backend requires torch_npu") from exc
++
++        try:
++            import torchair  # type: ignore
++        except ModuleNotFoundError:
++            try:
++                from torch_npu.dynamo import torchair  # type: ignore
++            except Exception as exc:
++                raise RuntimeError("TorchAir backend requires torchair") from exc
++            sys.modules.setdefault("torchair", torchair)
++
++        config_cls = getattr(torchair, "CompilerConfig", None)
++        if config_cls is None:
++            from torchair.configs.compiler_config import CompilerConfig as config_cls  # type: ignore
++
++        compiler_config = config_cls()
++        experimental_config = getattr(compiler_config, "experimental_config", None)
++        if experimental_config is not None:
++            # 冻结参数有利于常量折叠，tiling 调度优化用于提升 NPU kernel 排布效率。
++            if hasattr(experimental_config, "frozen_parameter"):
++                experimental_config.frozen_parameter = frozen_parameter
++            if hasattr(experimental_config, "tiling_schedule_optimize"):
++                experimental_config.tiling_schedule_optimize = tiling_schedule_optimize
++        return torchair.get_npu_backend(compiler_config=compiler_config)
++
++    def _can_use_compiled_action_inference(self, rtc_kwargs: dict[str, Any]) -> bool:
++        return (
++            self._sample_actions_graph_compile_enabled
++            and self._compiled_action_prefix_forward is not None
++            and self._compiled_action_denoise_10_steps is not None
++            and self.rtc_processor is None
++            and not rtc_kwargs
++        )
++
++    def _make_action_graph_att_2d_masks(self, pad_masks, att_masks):
++        cumsum = torch.cumsum(att_masks, dim=1)
++        att_2d_masks = cumsum.unsqueeze(1) <= cumsum.unsqueeze(2)
++        pad_2d_masks = pad_masks.unsqueeze(1) & pad_masks.unsqueeze(2)
++        return att_2d_masks & pad_2d_masks
++
+     def sample_noise(self, shape, device):
+-        return torch.normal(
++        target_dtype = self._action_compute_dtype(device)
++        normal_dtype = target_dtype
++        if torch.device(device).type == "npu" and target_dtype == torch.bfloat16:
++            normal_dtype = torch.float32
++        noise = torch.normal(
+             mean=0.0,
+             std=1.0,
+             size=shape,
+-            dtype=torch.float32,
++            dtype=normal_dtype,
+             device=device,
+         )
++        if noise.dtype != target_dtype:
++            return noise.to(dtype=target_dtype)
++        return noise
+ 
+     def sample_time(self, bsize, device):
+         time_beta = sample_beta(
+@@ -660,20 +1724,28 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
+         """Embed images with SigLIP and language tokens with embedding layer."""
+         embs = []
+         pad_masks = []
+-        att_masks = []
+-
+-        # Process images
+-        for img, img_mask in zip(images, img_masks, strict=True):
+-
+-            def image_embed_func(img):
+-                return self.paligemma_with_expert.embed_image(img)
+ 
+-            img_emb = self._apply_checkpoint(image_embed_func, img)
+-            bsize, num_img_embs = img_emb.shape[:2]
+-
+-            embs.append(img_emb)
+-            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+-            att_masks += [0] * num_img_embs
++        # Process all camera views in one vision-tower forward. This preserves the
++        # original prefix token order: view0 tokens, then view1 tokens, etc.
++        def image_embed_func(stacked_images):
++            bsize, num_views = stacked_images.shape[:2]
++            flat_images = stacked_images.reshape(bsize * num_views, *stacked_images.shape[2:])
++            flat_img_emb = self.paligemma_with_expert.embed_image(flat_images)
++            num_img_embs, hidden_dim = flat_img_emb.shape[1:]
++            return flat_img_emb.reshape(bsize, num_views * num_img_embs, hidden_dim)
++
++        stacked_images = torch.stack(images, dim=1)
++        img_emb = self._apply_checkpoint(image_embed_func, stacked_images)
++        if not self.training:
++            img_emb = self._cast_action_tensor(img_emb)
++        bsize = img_emb.shape[0]
++        num_img_embs = img_emb.shape[1] // len(images)
++
++        embs.append(img_emb)
++        stacked_img_masks = torch.stack(img_masks, dim=1)
++        pad_masks.append(
++            stacked_img_masks[:, :, None].expand(bsize, len(images), num_img_embs).reshape(bsize, -1)
++        )
+ 
+         # Process language tokens
+         def lang_embed_func(lang_tokens):
+@@ -681,18 +1753,18 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
+             return lang_emb
+ 
+         lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
++        if not self.training:
++            lang_emb = self._cast_action_tensor(lang_emb)
+         embs.append(lang_emb)
+         pad_masks.append(lang_masks)
+ 
+-        num_lang_embs = lang_emb.shape[1]
+-        att_masks += [0] * num_lang_embs
+-
+         embs = torch.cat(embs, dim=1)
+         pad_masks = torch.cat(pad_masks, dim=1)
+-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
+ 
+         bsize = pad_masks.shape[0]
+-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
++        # prefix token 全部属于同一组 attention block，mask 全为 0。
++        # 直接在目标 device 上构造，避免 npugraph_ex 捕获流中出现 CPU->NPU 同步拷贝。
++        att_masks = torch.zeros(bsize, pad_masks.shape[1], dtype=torch.bool, device=pad_masks.device)
+ 
+         return embs, pad_masks, att_masks
+ 
+@@ -700,10 +1772,10 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
+         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
+         embs = []
+         pad_masks = []
+-        att_masks = []
+ 
+-        if self.state_proj.weight.dtype == torch.float32:
+-            state = state.to(torch.float32)
++        state = state.to(dtype=self.state_proj.weight.dtype)
++        noisy_actions = noisy_actions.to(dtype=self.action_in_proj.weight.dtype)
++        timestep = timestep.to(dtype=noisy_actions.dtype)
+ 
+         def state_proj_func(state):
+             return self.state_proj(state)
+@@ -715,25 +1787,24 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
+ 
+         state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
+         pad_masks.append(state_mask)
+-        att_masks += [1]
+ 
+         # Embed timestep using sine-cosine positional encoding
+-        time_emb = create_sinusoidal_pos_embedding(
+-            timestep,
+-            self.action_in_proj.out_features,
+-            min_period=self.config.min_period,
+-            max_period=self.config.max_period,
+-            device=timestep.device,
+-        )
+-        time_emb = time_emb.type(dtype=timestep.dtype)
++        time_emb = self._create_action_time_embedding(timestep)
+ 
+         # Fuse timestep + action information using an MLP
+         def action_proj_func(noisy_actions):
+             return self.action_in_proj(noisy_actions)
+ 
+         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
+-
+-        time_emb = time_emb[:, None, :].expand_as(action_emb)
++        time_emb = time_emb.to(dtype=action_emb.dtype)
++
++        # 这里不用 expand_as，是因为 TorchDynamo+TorchAir 在 NPU trace
++        # denoise 子图时可能无法稳定解析目标 tensor，显式展开到 action_emb 的三维形状更稳。
++        time_emb = time_emb[:, None, :].expand(
++            action_emb.shape[0],
++            action_emb.shape[1],
++            action_emb.shape[2],
++        )
+         action_time_emb = torch.cat([action_emb, time_emb], dim=2)
+ 
+         def mlp_func(action_time_emb):
+@@ -749,16 +1820,65 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
+         action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
+         pad_masks.append(action_time_mask)
+ 
+-        # Set attention masks so that image, language and state inputs do not attend to action tokens
+-        att_masks += [1] + ([0] * (self.config.chunk_size - 1))
+-
+         embs = torch.cat(embs, dim=1)
+         pad_masks = torch.cat(pad_masks, dim=1)
+-        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
+-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
++
++        # Set attention masks so that image, language and state inputs do not attend to action tokens.
++        # 旧写法 torch.tensor([1, 1, 0, ...], device=npu) 会产生 CPU->NPU 同步拷贝；
++        # npugraph_ex 捕获流中不允许同步拷贝，因此这里完全在 NPU 上构造等价 mask。
++        state_att_mask = torch.ones(bsize, 1, dtype=embs.dtype, device=embs.device)
++        first_action_att_mask = torch.ones(bsize, 1, dtype=embs.dtype, device=embs.device)
++        remaining_action_att_mask = torch.zeros(
++            bsize, action_time_dim - 1, dtype=embs.dtype, device=embs.device
++        )
++        att_masks = torch.cat(
++            [state_att_mask, first_action_att_mask, remaining_action_att_mask],
++            dim=1,
++        )
+ 
+         return embs, pad_masks, att_masks, adarms_cond
+ 
++    def _embed_suffix_embs_with_time_mlp_bias(self, state, noisy_actions, time_mlp_in_bias):
++        """Build state/action suffix embeddings without recreating fixed masks."""
++        state = state.to(dtype=self.state_proj.weight.dtype)
++        noisy_actions = noisy_actions.to(dtype=self.action_in_proj.weight.dtype)
++
++        def state_proj_func(state):
++            return self.state_proj(state)
++
++        state_emb = self._apply_checkpoint(state_proj_func, state)
++
++        def action_proj_func(noisy_actions):
++            return self.action_in_proj(noisy_actions)
++
++        action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
++        action_weight = self._action_time_mlp_in_action_weight
++
++        def mlp_func(action_emb, time_mlp_in_bias):
++            x = F.linear(action_emb, action_weight, time_mlp_in_bias)
++            x = F.silu(x)
++            return self.action_time_mlp_out(x)
++
++        action_time_emb = self._apply_checkpoint(mlp_func, action_emb, time_mlp_in_bias)
++        return torch.cat([state_emb[:, None, :], action_time_emb], dim=1)
++
++    def embed_suffix_with_time_mlp_bias(self, state, noisy_actions, time_mlp_in_bias):
++        """Embed action suffix using a precomputed fixed-step time MLP input bias."""
++        embs = self._embed_suffix_embs_with_time_mlp_bias(state, noisy_actions, time_mlp_in_bias)
++        bsize, suffix_len = embs.shape[:2]
++        device = embs.device
++
++        pad_masks = torch.ones(bsize, suffix_len, dtype=torch.bool, device=device)
++        state_att_mask = torch.ones(bsize, 1, dtype=embs.dtype, device=embs.device)
++        first_action_att_mask = torch.ones(bsize, 1, dtype=embs.dtype, device=embs.device)
++        remaining_action_att_mask = torch.zeros(bsize, suffix_len - 2, dtype=embs.dtype, device=embs.device)
++        att_masks = torch.cat(
++            [state_att_mask, first_action_att_mask, remaining_action_att_mask],
++            dim=1,
++        )
++
++        return embs, pad_masks, att_masks, None
++
+     def forward(self, images, img_masks, lang_tokens, lang_masks, state, actions, noise, time) -> Tensor:
+         """Do a full training forward pass and compute the loss."""
+         time_expanded = time[:, None, None]
+@@ -801,7 +1921,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
+         )
+ 
+         suffix_out = suffix_out[:, -self.config.chunk_size :]
+-        suffix_out = suffix_out.to(dtype=torch.float32)
++        suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
+ 
+         def action_out_proj_func(suffix_out):
+             return self.action_out_proj(suffix_out)
+@@ -810,6 +1930,264 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
+ 
+         return F.mse_loss(u_t, v_t, reduction="none")
+ 
++    def _action_prefix_embed_for_compile(self, images, img_masks, lang_tokens, lang_masks):
++        # prefix 第一阶段：SigLIP 视觉塔、多模态投影和语言 token embedding。
++        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
++            images, img_masks, lang_tokens, lang_masks
++        )
++        return prefix_embs, prefix_pad_masks, prefix_att_masks
++
++    def _action_prefix_masks_for_compile(self, prefix_pad_masks, prefix_att_masks):
++        # prefix 第二阶段：根据 padding mask 和 attention block mask 构造二维 attention mask
++        # 与 position_ids；这一段通常是轻量张量逻辑，但图内 shape 推断问题也常在这里暴露。
++        prefix_att_2d_masks = self._make_action_graph_att_2d_masks(prefix_pad_masks, prefix_att_masks)
++        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
++        return prefix_att_2d_masks, prefix_position_ids
++
++    def _action_prefix_mask4d_for_compile(self, prefix_att_2d_masks):
++        # prefix 第三阶段：把 bool 2D mask 转成 Gemma/PFA 可消费的 4D additive mask。
++        return self._prepare_attention_masks_4d(prefix_att_2d_masks)
++
++    def _action_prefix_prefill_for_compile(
++        self,
++        prefix_embs,
++        prefix_att_2d_masks_4d,
++        prefix_position_ids,
++    ):
++        # prefix 第四阶段：PaliGemma language model prefill，并产出后续 denoise 复用的 KV cache。
++        _, past_key_values = self.paligemma_with_expert.forward(
++            attention_mask=prefix_att_2d_masks_4d,
++            position_ids=prefix_position_ids,
++            past_key_values=None,
++            inputs_embeds=[prefix_embs, None],
++            use_cache=True,
++        )
++        return past_key_values
++
++    def _action_prefix_forward_for_compile(self, images, img_masks, lang_tokens, lang_masks):
++        # 图编译 prefix 子图只做视觉/语言前缀编码并产出 KV cache；
++        # timestep 调度由后续固定 10 步 denoise 整图承担。
++        prefix_embs, prefix_pad_masks, prefix_att_masks = self._action_prefix_embed_for_compile(
++            images, img_masks, lang_tokens, lang_masks
++        )
++        prefix_att_2d_masks, prefix_position_ids = self._action_prefix_masks_for_compile(
++            prefix_pad_masks, prefix_att_masks
++        )
++        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
++        past_key_values = self._action_prefix_prefill_for_compile(
++            prefix_embs,
++            prefix_att_2d_masks_4d,
++            prefix_position_ids,
++        )
++        return prefix_pad_masks, past_key_values
++
++    def _action_denoise_step_for_compile(
++        self,
++        state,
++        prefix_pad_masks,
++        past_key_values,
++        x_t,
++        timestep,
++    ):
++        # 图编译 denoise 子图只封装单步速度场预测，
++        # 外层 Python 循环复用这个子图完成 num_inference_steps 次迭代。
++        # timestep 由外层采样循环传入；dt 与 Euler 更新也留在外层，避免
++        # denoise 图承担采样调度逻辑。
++        return self.denoise_step(
++            state=state,
++            prefix_pad_masks=prefix_pad_masks,
++            past_key_values=past_key_values,
++            x_t=x_t,
++            timestep=timestep,
++        )
++
++    def _denoise_step_from_suffix_embs(
++        self,
++        prefix_pad_masks,
++        past_key_values,
++        suffix_embs,
++        suffix_pad_masks,
++        suffix_att_masks,
++        adarms_cond,
++    ):
++        full_att_2d_masks_4d, position_ids = self._prepare_denoise_mask_context(
++            prefix_pad_masks,
++            suffix_pad_masks,
++            suffix_att_masks,
++        )
++        return self._run_action_denoise_forward(
++            past_key_values,
++            suffix_embs,
++            full_att_2d_masks_4d,
++            position_ids,
++            adarms_cond,
++        )
++
++    def _prepare_denoise_mask_context(self, prefix_pad_masks, suffix_pad_masks, suffix_att_masks):
++        """Build the fixed denoise attention mask and position ids once per inference."""
++        suffix_len = suffix_pad_masks.shape[1]
++        batch_size = prefix_pad_masks.shape[0]
++        prefix_len = prefix_pad_masks.shape[1]
++
++        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
++        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
++        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
++
++        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
++        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
++
++        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
++        return full_att_2d_masks_4d, position_ids
++
++    def _prepare_denoise_mask_context_for_compile(self, prefix_pad_masks, x_t):
++        """Prepare fixed suffix masks outside the compiled 10-step denoise loop."""
++        batch_size = x_t.shape[0]
++        suffix_len = self.config.chunk_size + 1
++        device = x_t.device
++        suffix_pad_masks = torch.ones(batch_size, suffix_len, dtype=torch.bool, device=device)
++        suffix_att_masks = torch.cat(
++            [
++                torch.ones(batch_size, 2, dtype=x_t.dtype, device=device),
++                torch.zeros(batch_size, suffix_len - 2, dtype=x_t.dtype, device=device),
++            ],
++            dim=1,
++        )
++
++        full_att_2d_masks_4d, _ = self._prepare_denoise_mask_context(
++            prefix_pad_masks,
++            suffix_pad_masks,
++            suffix_att_masks,
++        )
++        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
++        position_ids = prefix_offsets + self._action_denoise_suffix_position_ids[None, :]
++        return full_att_2d_masks_4d, position_ids
++
++    def _run_action_denoise_forward(
++        self,
++        past_key_values,
++        suffix_embs,
++        full_att_2d_masks_4d,
++        position_ids,
++        adarms_cond=None,
++    ):
++        """Run one action-expert forward with already prepared mask context."""
++        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = (  # noqa: SLF001
++            "eager_bmm"
++            if self._sample_actions_graph_compile_enabled and suffix_embs.device.type == "npu"
++            else "eager"
++        )
++
++        past_key_values = clone_past_key_values(past_key_values)
++        outputs_embeds, _ = self.paligemma_with_expert.forward(
++            attention_mask=full_att_2d_masks_4d,
++            position_ids=position_ids,
++            past_key_values=past_key_values,
++            inputs_embeds=[None, suffix_embs],
++            use_cache=False,
++            adarms_cond=[None, adarms_cond],
++        )
++
++        suffix_out = outputs_embeds[1]
++        suffix_out = suffix_out[:, -self.config.chunk_size :]
++        suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
++        return self.action_out_proj(suffix_out)
++
++    def _denoise_step_with_prepared_mask_context(
++        self,
++        state,
++        past_key_values,
++        x_t,
++        time_mlp_in_bias,
++        full_att_2d_masks_4d,
++        position_ids,
++    ):
++        suffix_embs = self._embed_suffix_embs_with_time_mlp_bias(state, x_t, time_mlp_in_bias)
++        return self._run_action_denoise_forward(
++            past_key_values,
++            suffix_embs,
++            full_att_2d_masks_4d,
++            position_ids,
++        )
++
++    def denoise_step_with_time_mlp_bias(
++        self,
++        state,
++        prefix_pad_masks,
++        past_key_values,
++        x_t,
++        time_mlp_in_bias,
++    ):
++        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix_with_time_mlp_bias(
++            state,
++            x_t,
++            time_mlp_in_bias,
++        )
++        return self._denoise_step_from_suffix_embs(
++            prefix_pad_masks,
++            past_key_values,
++            suffix_embs,
++            suffix_pad_masks,
++            suffix_att_masks,
++            adarms_cond,
++        )
++
++    def _action_denoise_10_steps_for_compile(
++        self,
++        state,
++        prefix_pad_masks,
++        past_key_values,
++        x_t,
++    ):
++        # TorchAir 优化路径固定 10 步 denoise，并把 10 次 action expert 调用
++        # 与 Euler 更新一起捕获进同一张图。prefix KV cache 在 10 步内只读复用。
++        dt_tensor = self._action_denoise_dt.to(dtype=x_t.dtype)
++        time_mlp_in_bias_table = self._action_denoise_time_mlp_in_bias_table
++        # suffix mask 和 position_ids 在 10 步中不变，循环外只构造一次，
++        # 避免每步重复 cat/cumsum/sum 并减少 TorchAir 图内小算子。
++        full_att_2d_masks_4d, position_ids = self._prepare_denoise_mask_context_for_compile(
++            prefix_pad_masks,
++            x_t,
++        )
++        for step in range(PI0_GRAPH_DENOISE_STEPS):
++            v_t = self._denoise_step_with_prepared_mask_context(
++                state=state,
++                past_key_values=past_key_values,
++                x_t=x_t,
++                time_mlp_in_bias=time_mlp_in_bias_table[step],
++                full_att_2d_masks_4d=full_att_2d_masks_4d,
++                position_ids=position_ids,
++            )
++            x_t = x_t + dt_tensor * v_t
++        return x_t
++
++    def _sample_actions_graph_inference(
++        self,
++        images,
++        img_masks,
++        lang_tokens,
++        lang_masks,
++        state,
++        noise,
++        num_steps,
++    ):
++        # 编译推理入口。先运行一次 prefix 图得到 KV cache，再调用一次
++        # 已编译的 10 步 denoise 整图，避免 Python 在 denoise step 之间往返调度。
++        if int(num_steps) != PI0_GRAPH_DENOISE_STEPS:
++            raise ValueError(
++                "PI0 graph inference now compiles denoise as one fixed 10-step TorchAir graph; "
++                f"got num_steps={num_steps}."
++            )
++        state = self._cast_action_tensor(state)
++        noise = self._cast_action_tensor(noise)
++        x_t = noise
++        if self._compiled_action_prefix_forward is None or self._compiled_action_denoise_10_steps is None:
++            raise RuntimeError("graph inference requires compiled prefix and 10-step denoise callables")
++        prefix_pad_masks, past_key_values = self._compiled_action_prefix_forward(
++            images, img_masks, lang_tokens, lang_masks
++        )
++        x_t = self._compiled_action_denoise_10_steps(state, prefix_pad_masks, past_key_values, x_t)
++        return x_t
++
+     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
+     def sample_actions(
+         self,
+@@ -837,6 +2215,20 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
+                 self.config.max_action_dim,
+             )  # Use config max_action_dim for internal processing
+             noise = self.sample_noise(actions_shape, device)
++        state = self._cast_action_tensor(state)
++        noise = self._cast_action_tensor(noise)
++
++        if self._can_use_compiled_action_inference(kwargs):
++            # 未携带 RTC 动态参数时，优先使用显式开启的图编译推理路径。
++            return self._sample_actions_graph_inference(
++                images,
++                img_masks,
++                lang_tokens,
++                lang_masks,
++                state,
++                noise,
++                num_steps,
++            ).to(dtype=torch.float32)
+ 
+         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+             images, img_masks, lang_tokens, lang_masks
+@@ -856,11 +2248,16 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
+         )
+ 
+         dt = -1.0 / num_steps
+-
++        dt_tensor = noise.new_tensor(dt)
+         x_t = noise
+         for step in range(num_steps):
+-            time = 1.0 + step * dt
+-            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
++            time_value = 1.0 + step * dt
++            time_tensor = torch.full(
++                (bsize,),
++                time_value,
++                dtype=self._action_compute_dtype(device),
++                device=device,
++            )
+ 
+             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
+                 return self.denoise_step(
+@@ -880,19 +2277,19 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
+                     x_t=x_t,
+                     prev_chunk_left_over=prev_chunk_left_over,
+                     inference_delay=inference_delay,
+-                    time=time,
++                    time=time_value,
+                     original_denoise_step_partial=denoise_step_partial_call,
+                     execution_horizon=execution_horizon,
+                 )
+             else:
+                 v_t = denoise_step_partial_call(x_t)
+ 
+-            x_t = x_t + dt * v_t
++            x_t = x_t + dt_tensor * v_t
+ 
+             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
+-                self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
++                self.rtc_processor.track(time=time_value, x_t=x_t, v_t=v_t)
+ 
+-        return x_t
++        return x_t.to(dtype=torch.float32)
+ 
+     def denoise_step(
+         self,
+@@ -904,36 +2301,15 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
+     ):
+         """Apply one denoising step of the noise `x_t` at a given timestep."""
+         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+-
+-        suffix_len = suffix_pad_masks.shape[1]
+-        batch_size = prefix_pad_masks.shape[0]
+-        prefix_len = prefix_pad_masks.shape[1]
+-
+-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+-        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+-
+-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+-
+-        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+-
+-        past_key_values = clone_past_key_values(past_key_values)
+-        outputs_embeds, _ = self.paligemma_with_expert.forward(
+-            attention_mask=full_att_2d_masks_4d,
+-            position_ids=position_ids,
+-            past_key_values=past_key_values,
+-            inputs_embeds=[None, suffix_embs],
+-            use_cache=False,
+-            adarms_cond=[None, adarms_cond],
++        return self._denoise_step_from_suffix_embs(
++            prefix_pad_masks,
++            past_key_values,
++            suffix_embs,
++            suffix_pad_masks,
++            suffix_att_masks,
++            adarms_cond,
+         )
+ 
+-        suffix_out = outputs_embeds[1]
+-        suffix_out = suffix_out[:, -self.config.chunk_size :]
+-        suffix_out = suffix_out.to(dtype=torch.float32)
+-        return self.action_out_proj(suffix_out)
+-
+ 
+ class PI0Policy(PreTrainedPolicy):
+     """PI0 OpenPI Policy for LeRobot."""
+@@ -951,6 +2327,7 @@ class PI0Policy(PreTrainedPolicy):
+             config: Policy configuration class instance.
+         """
+         require_package("transformers", extra="pi")
++        _apply_fixed_pi0_inference_config(config)
+         super().__init__(config)
+         config.validate_features()
+         self.config = config
+@@ -967,6 +2344,12 @@ class PI0Policy(PreTrainedPolicy):
+ 
+         self.reset()
+ 
++    def prepare_inference_optimizations(self) -> dict[str, Any]:
++        """Finalize optional pi0 inference optimizations after loading or device placement."""
++        # policy 层统一暴露推理优化准备入口，factory/from_pretrained 都会调用到这里。
++        self.eval()
++        return self.model.prepare_inference_optimizations()
++
+     @classmethod
+     def from_pretrained(
+         cls: builtins.type[T],
+@@ -1005,6 +2388,9 @@ class PI0Policy(PreTrainedPolicy):
+                 revision=revision,
+                 **kwargs,
+             )
++        if not isinstance(config, PI0Config):
++            raise TypeError(f"Expected PI0Config, got {type(config)}")
++        _apply_fixed_pi0_inference_config(config)
+ 
+         # Initialize model without loading weights
+         # Check if dataset_stats were provided in kwargs
+@@ -1034,6 +2420,7 @@ class PI0Policy(PreTrainedPolicy):
+             except Exception as e:
+                 print(f"Could not load state dict from remote files: {e}")
+                 print("Returning model without loading pretrained weights")
++                model.prepare_inference_optimizations()
+                 return model
+ 
+             # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
+@@ -1083,6 +2470,7 @@ class PI0Policy(PreTrainedPolicy):
+         except Exception as e:
+             print(f"Warning: Could not load state dict: {e}")
+ 
++        model.prepare_inference_optimizations()
+         return model
+ 
+     def _fix_pytorch_state_dict_keys(
+@@ -1203,22 +2591,15 @@ class PI0Policy(PreTrainedPolicy):
+ 
+             # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
+             is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
+-
+-            if is_channels_first:
+-                # Convert [B, C, H, W] to [B, H, W, C] for processing
+-                img = img.permute(0, 2, 3, 1)
++            image_hw = img.shape[2:4] if is_channels_first else img.shape[1:3]
+ 
+             # from openpi preprocess_observation_pytorch: Resize with padding if needed
+-            if img.shape[1:3] != self.config.image_resolution:
++            if image_hw != self.config.image_resolution:
+                 img = resize_with_pad_torch(img, *self.config.image_resolution)
+ 
+             # Normalize from [0,1] to [-1,1] as expected by siglip
+             img = img * 2.0 - 1.0
+ 
+-            # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
+-            if is_channels_first:
+-                img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+-
+             images.append(img)
+             # Create mask (all ones for real images)
+             bsize = img.shape[0]
+@@ -1264,7 +2645,7 @@ class PI0Policy(PreTrainedPolicy):
+     @torch.no_grad()
+     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
+         """Predict a chunk of actions given environment observations."""
+-        self.eval()
++        # self.eval()
+ 
+         # Prepare inputs
+         images, img_masks = self._preprocess_images(batch)
+diff --git a/src/lerobot/policies/pi0/vision_siglip_npu.py b/src/lerobot/policies/pi0/vision_siglip_npu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..461d805c3dac96dd4d2e94b483855f998bd9121f
+--- /dev/null
++++ b/src/lerobot/policies/pi0/vision_siglip_npu.py
+@@ -0,0 +1,369 @@
++#!/usr/bin/env python
++
++"""Local SigLIP vision tower used by PI0 NPU inference optimizations."""
++
++from __future__ import annotations
++
++import math
++from typing import Any
++
++import torch
++import torch.nn.functional as F  # noqa: N812
++from torch import nn
++from transformers.activations import ACT2FN
++from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
++
++
++def _import_torch_npu():
++    # 仅在设备侧确实需要 PFA 时加载 torch_npu，保持 CPU/CUDA 导入路径可用。
++    try:
++        import torch_npu  # type: ignore
++    except ModuleNotFoundError:
++        return None
++    return torch_npu
++
++
++def _blocked_attention_mask(attention_mask: torch.Tensor | None) -> torch.Tensor | None:
++    if attention_mask is None:
++        return None
++    # NPU PFA 使用 int8 blocked mask；普通 eager 路径仍保留原始 additive mask。
++    if attention_mask.dtype == torch.bool:
++        blocked_mask = torch.logical_not(attention_mask)
++    else:
++        blocked_mask = attention_mask < 0
++    return blocked_mask.to(dtype=torch.int8, memory_format=torch.contiguous_format)
++
++
++class PI0SiglipVisionEmbeddings(nn.Module):
++    def __init__(self, config):
++        super().__init__()
++        self.config = config
++        self.embed_dim = config.hidden_size
++        self.image_size = config.image_size
++        self.patch_size = config.patch_size
++        self.patch_embedding = nn.Conv2d(
++            in_channels=config.num_channels,
++            out_channels=self.embed_dim,
++            kernel_size=self.patch_size,
++            stride=self.patch_size,
++            padding="valid",
++        )
++        self.num_patches = (self.image_size // self.patch_size) ** 2
++        self.num_positions = self.num_patches
++        self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
++        self.register_buffer(
++            "position_ids",
++            torch.arange(self.num_positions).expand((1, -1)),
++            persistent=False,
++        )
++
++    def interpolate_pos_encoding(self, embeddings: torch.Tensor, height: int, width: int) -> torch.Tensor:
++        num_patches = embeddings.shape[1]
++        num_positions = self.position_embedding.weight.shape[0]
++        if not torch.jit.is_tracing() and num_patches == num_positions and height == width:
++            return self.position_embedding(self.position_ids)
++
++        patch_pos_embed = self.position_embedding.weight.unsqueeze(0)
++        dim = embeddings.shape[-1]
++        new_height = height // self.patch_size
++        new_width = width // self.patch_size
++        sqrt_num_positions = int(num_positions**0.5)
++        patch_pos_embed = patch_pos_embed.reshape(1, sqrt_num_positions, sqrt_num_positions, dim)
++        patch_pos_embed = patch_pos_embed.permute(0, 3, 1, 2)
++        patch_pos_embed = F.interpolate(
++            patch_pos_embed,
++            size=(new_height, new_width),
++            mode="bicubic",
++            align_corners=False,
++        )
++        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
++        return patch_pos_embed
++
++    def forward(
++        self,
++        pixel_values: torch.FloatTensor,
++        interpolate_pos_encoding: bool = False,
++    ) -> torch.Tensor:
++        _, _, height, width = pixel_values.shape
++        target_dtype = self.patch_embedding.weight.dtype
++        patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))
++        embeddings = patch_embeds.flatten(2).transpose(1, 2)
++        if interpolate_pos_encoding:
++            embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)
++        else:
++            embeddings = embeddings + self.position_embedding(self.position_ids)
++        return embeddings
++
++
++class PI0SiglipAttention(nn.Module):
++    """SigLIP self-attention with optional NPU QKV/PFA inference path."""
++
++    def __init__(self, config):
++        super().__init__()
++        self.config = config
++        self.embed_dim = config.hidden_size
++        self.num_heads = config.num_attention_heads
++        self.head_dim = self.embed_dim // self.num_heads
++        if self.head_dim * self.num_heads != self.embed_dim:
++            raise ValueError(
++                f"embed_dim must be divisible by num_heads, got {self.embed_dim} and {self.num_heads}"
++            )
++        self.scale = self.head_dim**-0.5
++        self.dropout = config.attention_dropout
++        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
++        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
++        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
++        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
++        self.qkv: nn.Linear | None = None
++        self._npu_pfa_enabled = False
++
++    @torch.no_grad()
++    def fuse_qkv_weights(self) -> None:
++        if self.qkv is not None:
++            return
++        # 将三次独立投影合并为一次 Linear，减少视觉塔中的矩阵乘法调用次数。
++        qkv_weight = torch.cat(
++            [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight],
++            dim=0,
++        ).contiguous()
++        qkv_bias = torch.cat([self.q_proj.bias, self.k_proj.bias, self.v_proj.bias], dim=0).contiguous()
++        self.qkv = nn.Linear(
++            qkv_weight.shape[1],
++            qkv_weight.shape[0],
++            bias=True,
++            device=qkv_weight.device,
++            dtype=qkv_weight.dtype,
++        )
++        self.qkv.weight.copy_(qkv_weight)
++        self.qkv.bias.copy_(qkv_bias)
++        self.qkv.weight.requires_grad_(False)
++        self.qkv.bias.requires_grad_(False)
++
++    def enable_npu_pfa(self, enabled: bool = True) -> None:
++        # 只有 eval、NPU 和半精度条件同时满足时，forward 才会选择 PFA。
++        self._npu_pfa_enabled = bool(enabled)
++
++    def _project_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        hidden_shape = (*hidden_states.shape[:-1], self.num_heads, self.head_dim)
++        if self.qkv is not None:
++            qkv = self.qkv(hidden_states)
++            query, key, value = qkv.split([self.embed_dim, self.embed_dim, self.embed_dim], dim=-1)
++        else:
++            query = self.q_proj(hidden_states)
++            key = self.k_proj(hidden_states)
++            value = self.v_proj(hidden_states)
++        return query.view(hidden_shape), key.view(hidden_shape), value.view(hidden_shape)
++
++    def _can_use_npu_pfa(self, query: torch.Tensor) -> bool:
++        return (
++            self._npu_pfa_enabled
++            and not self.training
++            and query.device.type == "npu"
++            and query.dtype in {torch.float16, torch.bfloat16}
++            and _import_torch_npu() is not None
++        )
++
++    def _eager_attention(
++        self,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        attention_mask: torch.Tensor | None,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        query_bnsd = query.transpose(1, 2)
++        key_bnsd = key.transpose(1, 2)
++        value_bnsd = value.transpose(1, 2)
++        attn_weights = torch.matmul(query_bnsd, key_bnsd.transpose(-1, -2)) * self.scale
++        if attention_mask is not None:
++            attn_weights = attn_weights + attention_mask
++        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
++        attn_weights = F.dropout(attn_weights, p=self.dropout, training=self.training)
++        attn_output = torch.matmul(attn_weights, value_bnsd)
++        return attn_output.transpose(1, 2).contiguous(), attn_weights
++
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        attention_mask: torch.Tensor | None = None,
++        **kwargs: Any,
++    ) -> tuple[torch.Tensor, torch.Tensor | None]:
++        input_shape = hidden_states.shape[:-1]
++        query, key, value = self._project_qkv(hidden_states)
++
++        if self._can_use_npu_pfa(query):
++            torch_npu = _import_torch_npu()
++            # PFA 固定使用 FP16 Q/K/V 计算以改善精度，输出在 out_proj 前恢复视觉塔 dtype。
++            output_dtype = hidden_states.dtype
++            attn_output = torch_npu.npu_prompt_flash_attention(
++                query.to(torch.float16).contiguous(),
++                key.to(torch.float16).contiguous(),
++                value.to(torch.float16).contiguous(),
++                num_heads=self.num_heads,
++                input_layout="BSND",
++                scale_value=1.0 / math.sqrt(self.head_dim),
++                pre_tokens=65535,
++                next_tokens=65535,
++                atten_mask=_blocked_attention_mask(attention_mask),
++                num_key_value_heads=self.num_heads,
++            )
++            attn_output = attn_output.to(output_dtype)
++            attn_weights = None
++        else:
++            attn_output, attn_weights = self._eager_attention(query, key, value, attention_mask)
++
++        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
++        attn_output = self.out_proj(attn_output)
++        return attn_output, attn_weights
++
++
++class PI0SiglipMLP(nn.Module):
++    def __init__(self, config):
++        super().__init__()
++        self.config = config
++        self.activation_fn = ACT2FN[config.hidden_act]
++        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
++        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
++
++    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        hidden_states = self.fc1(hidden_states)
++        hidden_states = self.activation_fn(hidden_states)
++        hidden_states = self.fc2(hidden_states)
++        return hidden_states
++
++
++class PI0SiglipEncoderLayer(nn.Module):
++    def __init__(self, config):
++        super().__init__()
++        self.embed_dim = config.hidden_size
++        self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
++        self.self_attn = PI0SiglipAttention(config)
++        self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
++        self.mlp = PI0SiglipMLP(config)
++
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        attention_mask: torch.Tensor | None = None,
++        **kwargs: Any,
++    ) -> torch.FloatTensor:
++        residual = hidden_states
++        hidden_states = self.layer_norm1(hidden_states)
++        hidden_states, _ = self.self_attn(
++            hidden_states=hidden_states,
++            attention_mask=attention_mask,
++            **kwargs,
++        )
++        hidden_states = residual + hidden_states
++
++        residual = hidden_states
++        hidden_states = self.layer_norm2(hidden_states)
++        hidden_states = self.mlp(hidden_states)
++        hidden_states = residual + hidden_states
++        return hidden_states
++
++
++class PI0SiglipEncoder(nn.Module):
++    def __init__(self, config):
++        super().__init__()
++        self.config = config
++        self.layers = nn.ModuleList([PI0SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)])
++        self.gradient_checkpointing = False
++
++    def forward(
++        self,
++        inputs_embeds: torch.Tensor,
++        attention_mask: torch.Tensor | None = None,
++        **kwargs: Any,
++    ) -> BaseModelOutput:
++        hidden_states = inputs_embeds
++        for encoder_layer in self.layers:
++            hidden_states = encoder_layer(hidden_states, attention_mask, **kwargs)
++        return BaseModelOutput(last_hidden_state=hidden_states)
++
++
++class PI0SiglipMultiheadAttentionPoolingHead(nn.Module):
++    def __init__(self, config):
++        super().__init__()
++        self.probe = nn.Parameter(torch.randn(1, 1, config.hidden_size))
++        self.attention = nn.MultiheadAttention(
++            config.hidden_size,
++            config.num_attention_heads,
++            batch_first=True,
++        )
++        self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
++        self.mlp = PI0SiglipMLP(config)
++
++    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
++        batch_size = hidden_state.shape[0]
++        probe = self.probe.repeat(batch_size, 1, 1)
++        hidden_state = self.attention(probe, hidden_state, hidden_state)[0]
++        residual = hidden_state
++        hidden_state = self.layernorm(hidden_state)
++        hidden_state = residual + self.mlp(hidden_state)
++        return hidden_state[:, 0]
++
++
++class PI0SiglipVisionTransformer(nn.Module):
++    _input_embed_layer = "patch_embedding"
++
++    def __init__(self, config):
++        super().__init__()
++        self.config = config
++        embed_dim = config.hidden_size
++        self.embeddings = PI0SiglipVisionEmbeddings(config)
++        self.encoder = PI0SiglipEncoder(config)
++        self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
++        self.use_head = True if not hasattr(config, "vision_use_head") else config.vision_use_head
++        if self.use_head:
++            self.head = PI0SiglipMultiheadAttentionPoolingHead(config)
++
++    def forward(
++        self,
++        pixel_values: torch.Tensor,
++        interpolate_pos_encoding: bool | None = False,
++        **kwargs: Any,
++    ) -> BaseModelOutputWithPooling:
++        hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding=bool(interpolate_pos_encoding))
++        encoder_outputs = self.encoder(inputs_embeds=hidden_states, **kwargs)
++        last_hidden_state = self.post_layernorm(encoder_outputs.last_hidden_state)
++        pooler_output = self.head(last_hidden_state) if self.use_head else None
++        return BaseModelOutputWithPooling(last_hidden_state=last_hidden_state, pooler_output=pooler_output)
++
++
++class PI0SiglipVisionModel(nn.Module):
++    main_input_name = "pixel_values"
++    input_modalities = ("image",)
++
++    def __init__(self, config):
++        super().__init__()
++        self.config = config
++        self.gradient_checkpointing = False
++        self.vision_model = PI0SiglipVisionTransformer(config)
++
++    def get_input_embeddings(self) -> nn.Module:
++        return self.vision_model.embeddings.patch_embedding
++
++    def fuse_qkv_weights(self) -> None:
++        # 统一下发到每个 Encoder layer，确保视觉塔各层使用相同的投影布局。
++        for layer in self.vision_model.encoder.layers:
++            layer.self_attn.fuse_qkv_weights()
++
++    def enable_npu_pfa(self, enabled: bool = True) -> None:
++        # 由上层推理准备入口控制是否启用 NPU PFA。
++        for layer in self.vision_model.encoder.layers:
++            layer.self_attn.enable_npu_pfa(enabled)
++
++    def forward(
++        self,
++        pixel_values: torch.Tensor,
++        interpolate_pos_encoding: bool = False,
++        **kwargs: Any,
++    ) -> BaseModelOutputWithPooling:
++        return self.vision_model(
++            pixel_values=pixel_values,
++            interpolate_pos_encoding=interpolate_pos_encoding,
++            **kwargs,
++        )
++
++
++__all__ = ["PI0SiglipVisionModel"]

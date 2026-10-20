@@ -1,0 +1,11 @@
+# Python运行缓存
+__pycache__/
+*.py[cod]
+
+# 本地备份文件
+*.bak
+
+# 数据、验证结果和训练输出
+/data/
+/val/
+/work_dirs/

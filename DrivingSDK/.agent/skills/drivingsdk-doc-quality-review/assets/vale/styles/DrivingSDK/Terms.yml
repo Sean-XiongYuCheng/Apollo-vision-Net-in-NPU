@@ -1,0 +1,19 @@
+extends: substitution
+message: "术语大小写不规范：建议用 '%s' 而非 '%s'"
+level: warning
+# 大小写敏感，只匹配**确属大小写笔误**的写法，避免误伤代码/路径里的 mx_driving。
+ignorecase: false
+swap:
+  # 重要：产品名在本仓有 "DrivingSDK"(186) 与 "Driving SDK"(221) 两种写法，二者数量相当、
+  # 均被官方使用（GitCode 仓名 DrivingSDK / 文档标题 Driving SDK），**属需维护者定夺的规范问题，
+  # 故此处不强制统一空格/无空格**（否则会产出上百条方向可疑的"修复"）。
+  # 只规范化明确的大小写笔误，且各自留在原有的空格约定内：
+  '\bdrivingsdk\b': 'DrivingSDK'
+  '\bDrivingSdk\b': 'DrivingSDK'
+  '\bDrivingSDk\b': 'DrivingSDK'
+  '\bDRIVINGSDK\b': 'DrivingSDK'
+  'Driving Sdk': 'Driving SDK'
+  'Driving SDk': 'Driving SDK'
+  # pip 包名统一小写连字符（正文里对包名的错误大小写）：
+  'Mx-Driving': 'mx-driving'
+  'Mx_driving': 'mx_driving'

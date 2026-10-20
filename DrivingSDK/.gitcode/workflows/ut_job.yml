@@ -1,0 +1,61 @@
+name: Build Job
+
+on:
+  workflow_call:
+    inputs:
+      pr_id:
+        required: false
+        type: string
+        default: ${{ atomgit.event.pull_request.number }}
+      CP_DOCKER_IMG:
+        required: true
+        type: string
+      runs_on_arch:
+        required: false
+        type: string
+        default: "x64"
+      runs_on_spec:
+        required: false
+        type: string
+        default: "cpu=32"
+      REMOTE_URL:
+        required: false
+        type: string
+        default: ${{ env.ATOMGIT_REPOSITORY_URL }}
+
+jobs:
+  UT:
+    name: UT
+    select: selected_by_default
+    runs-on: [ self-hosted, drivingsdk, npu=1 ]
+    container:
+      image: ${{ inputs.CP_DOCKER_IMG }}
+    steps:
+      - name: checkout DrivingSDK
+        uses: checkout
+        with:
+          ref: refs/merge-requests/${{ inputs.pr_id }}/merge
+          fetch-depth: 1
+          path: CODE
+          allow-unsafe-pr-checkout: true
+
+      - name: Download artifact
+        uses: download-artifact
+        with:
+          name: DrivingSDK-arm
+          path: |
+              ./
+          overwrite: true
+          
+      - name: download modify_files.txt artifact
+        uses: download-artifact
+        with:
+          name: modify_files.txt
+          path: ./
+
+      - name: UT
+        run: |
+          git clone -b ${{ atomgit.event.repository.default_branch }} ${{ inputs.REMOTE_URL }} cie
+          cd cie/.gitcode/workflows/scripts
+          bash DrivingSDK_ut.sh ${ATOMGIT_WORKSPACE} ${{inputs.pr_id}}
+        

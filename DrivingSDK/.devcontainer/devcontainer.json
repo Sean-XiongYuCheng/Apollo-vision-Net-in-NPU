@@ -1,0 +1,62 @@
+{
+    "name": "DrivingSDK Dev (CANN 9.0.0 / 910b / openEuler 24.03)",
+
+    "build": {
+        "dockerfile": "../docker/devel/Dockerfile",
+        "context": "..",
+        "target": "dev",
+        "args": {
+            "CANN_VERSION": "9.0.0",
+            "NPU_TYPE": "910b",
+            "OS_TYPE": "openeuler24.03",
+            "BASE_PY_VERSION": "3.11",
+            "PTA_VERSION": "2.7.1",
+            "PY_VERSION": "3.10",
+            "CONDA_ENV_NAME": "torch2.7.1_py310",
+            "TORCH_NPU_POST": "6",
+            "SETUPTOOLS_VERSION": "76.0.0"
+        }
+    },
+
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/DrivingSDK_op,type=bind,consistency=consistent",
+    "workspaceFolder": "/workspace/DrivingSDK_op",
+
+    "remoteUser": "root",
+    "privileged": true,
+
+    "mounts": [
+        "source=/dev,target=/dev,type=bind,consistency=consistent",
+        "source=/usr/local/Ascend/driver,target=/usr/local/Ascend/driver,type=bind,consistency=consistent",
+        "source=/usr/local/Ascend/add-ons,target=/usr/local/Ascend/add-ons,type=bind,consistency=consistent",
+        "source=/usr/local/sbin/npu-smi,target=/usr/local/bin/npu-smi,type=bind,consistency=consistent",
+        "source=/var/log/npu,target=/usr/slog,type=bind,consistency=consistent"
+    ],
+
+    "remoteEnv": {
+        "LD_LIBRARY_PATH": "${containerEnv:LD_LIBRARY_PATH}:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/base:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver"
+    },
+
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-vscode.cpptools",
+                "ms-vscode.cpptools-extension-pack",
+                "ms-vscode.cmake-tools",
+                "ms-python.python",
+                "ms-python.black-formatter",
+                "ms-python.isort",
+                "eamodio.gitlens",
+                "editorconfig.editorconfig"
+            ],
+            "settings": {
+                "python.defaultInterpreterPath": "/opt/conda/envs/default/bin/python",
+                "python.linting.enabled": true,
+                "C_Cpp.default.compileCommands": "${workspaceFolder}/compile_commands.json",
+                "cmake.buildDirectory": "${workspaceFolder}/build",
+                "files.associations": {
+                    "*.h": "cpp"
+                }
+            }
+        }
+    }
+}

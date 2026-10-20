@@ -1,0 +1,372 @@
+# BEVFormer
+
+# 概述
+
+BEVFormer 通过提取环视相机采集到的图像特征，并将提取的环视特征通过模型学习的方式转换到 BEV 空间（模型去学习如何将特征从 图像坐标系转换到 BEV 坐标系），从而实现 3D 目标检测和地图分割任务。
+
+- 参考实现：
+
+  ```shell
+  url=https://github.com/fundamentalvision/BEVFormer
+  commit_id=66b65f3a1f58caf0507cb2a971b9c0e7f842376c
+  ```
+
+# 支持模型
+
+| Backbone          | Method          |   训练方式     |
+|-------------------|-----------------|---------------|
+| R101-DCN          | BEVFormer-base  |       FP32    |
+| R101-DCN          | BEVFormer-base  |    混合精度训练    |
+
+# 准备训练环境
+
+## 安装昇腾环境
+
+请参考昇腾社区中《[PyTorch框架训练环境准备](https://www.hiascend.com/document/detail/zh/Pytorch/latest/installguide/swinstall/docs/zh/installation_guide)》文档搭建昇腾环境。本仓已支持表1中软件版本。
+
+  **表 1**  昇腾软件版本支持表
+
+  |        软件类型        |   首次支持版本   |
+  |:------------------:|:--------:|
+  | TorchNPU | 7.0.0  |
+  |       CANN         | 8.1.RC1  |
+
+## 安装模型环境
+
+- 当前模型支持的 PyTorch 版本如下表所示。
+
+  **表 2**  版本支持表
+
+  | Torch_Version      |
+  | :--------: |
+  | PyTorch 2.1.0 |
+  | PyTorch 2.6.0 |
+  | PyTorch 2.7.1 |
+
+- 安装 [Driving SDK 加速库](https://gitcode.com/Ascend/DrivingSDK)
+
+- 克隆代码仓到当前目录
+
+- 推荐使用依赖安装一键配置脚本，可使用如下指令安装后续基础依赖、其他依赖、模型代码更新：
+
+   ```shell
+   bash install_BEVFormer.sh
+   ```
+
+  这里需要根据PyTorch版本修改脚本，使用对应的requirements文件,一键配置脚本默认使用torch2.1.0的requirements.txt
+- 根据PyTorch版本在模型根目录下安装依赖
+
+   若服务器为A2/A3，安装步骤如下：
+
+   - torch2.1.0
+
+    ```shell
+    pip install -r requirements.txt
+    ```
+
+   - torch2.6.0
+
+    ```shell
+    pip install -r requirements_pytorch2.6.0.txt
+    ```
+
+   - torch2.7.1
+
+    ```shell
+    pip install -r requirements_pytorch2.7.1.txt
+    ```
+
+   若服务器为A5，安装步骤如下：
+
+   - A5 torch2.7.1
+
+   ```shell
+    pip install -r requirements_pytorch2.7.1_a5.txt
+    ```
+
+- 安装其他依赖
+
+   1. 源码编译安装 mmcv 1.x
+
+      ```shell
+      git clone -b 1.x https://github.com/open-mmlab/mmcv.git
+      cp mmcv_config.patch mmcv
+      cd mmcv
+      git apply --reject mmcv_config.patch
+      pip install -r requirements/runtime.txt
+      MMCV_WITH_OPS=1 MAX_JOBS=8 FORCE_NPU=1 python setup.py build_ext
+      MMCV_WITH_OPS=1 FORCE_NPU=1 python setup.py develop
+      cd ..
+      ```
+
+   2. 源码安装 mmdetection3d v1.0.0rc4
+
+      ```shell
+      git clone -b v1.0.0rc4 https://github.com/open-mmlab/mmdetection3d.git
+      cp mmdet3d_config.patch mmdetection3d
+      cd mmdetection3d
+      git apply --reject mmdet3d_config.patch
+      pip install -e . --no-build-isolation
+      cd ..
+      ```
+
+   3. 源码安装 mmdet 2.24.0
+
+      若服务器为A2/A3，安装步骤如下：
+
+      ```shell
+      git clone -b v2.24.0 https://github.com/open-mmlab/mmdetection.git
+      cp mmdet_config.patch mmdetection
+      cd mmdetection
+      git apply --reject mmdet_config.patch
+      pip install -e . --no-build-isolation
+      cd ..
+      ```
+
+      若服务器为A5，安装步骤如下：
+
+      ```shell
+      git clone -b v2.24.0 https://github.com/open-mmlab/mmdetection.git
+      cp mmdet_a5.patch mmdetection
+      cd mmdetection
+      git apply --reject mmdet_a5.patch
+      pip install -e . --no-build-isolation
+      cd ..
+      ```
+
+   4. 安装 detectron2
+
+      ```shell
+      python -m pip install 'git+https://github.com/facebookresearch/detectron2.git' --no-build-isolation
+      ```
+
+- 模型代码更新
+
+   若服务器为A2/A3，步骤如下：
+
+     ```shell
+     git clone https://github.com/fundamentalvision/BEVFormer.git
+     cp bev_former_config.patch BEVFormer
+     cd BEVFormer
+     git checkout 66b65f3a1f58caf0507cb2a971b9c0e7f842376c
+     git apply --reject --whitespace=fix bev_former_config.patch
+     cd ..
+     ```
+
+   若服务器为A5，步骤如下：
+
+   ```shell
+   git clone https://github.com/fundamentalvision/BEVFormer.git
+   cp bevformer_a5.patch BEVFormer
+   cp patch_a5.py BEVFormer/tools
+   mv BEVFormer/tools/patch_a5.py BEVFormer/tools/patch.py
+   cd BEVFormer
+   git checkout 66b65f3a1f58caf0507cb2a971b9c0e7f842376c
+   git apply --reject --whitespace=fix bevformer_a5.patch
+   cd ..
+   ```
+
+## 准备数据集
+
+1. 用户需自行下载 nuScenes V1.0 full 和 CAN bus 数据集放置在BEVFormer模型代码目录下，结构如下：
+
+   ```shell
+    BEVFormer
+    ├── data/
+    │   ├── can_bus/
+    │   ├── nuscenes/
+    │   │   ├── maps/
+    │   │   ├── samples/
+    │   │   ├── sweeps/
+    │   │   ├── v1.0-test/
+    │   │   ├── v1.0-trainval/
+    │   │   ├── nuscenes_infos_temporal_train.pkl
+    │   │   ├── nuscenes_infos_temporal_val.pkl
+   ```
+
+2. 数据预处理
+
+   执行下面的命令进行数据预处理（若出现`ModuleNotFoundError: No module named 'tools.data_converter'`问题，参考FAQ进行处理）。
+
+   ```shell
+   python tools/create_data.py nuscenes --root-path ./data/nuscenes --out-dir ./data/nuscenes --extra-tag nuscenes --version v1.0 --canbus ./data
+   ```
+
+## 下载预训练权重
+
+   在BEVFormer模型代码目录下创建 ckpts 文件夹，下载预训练权重 r101_dcn_fcos3d_pretrain.pth
+
+   ```shell
+   mkdir ckpts
+   cd ckpts
+   wget https://github.com/zhiqi-li/storage/releases/download/v1.0/r101_dcn_fcos3d_pretrain.pth
+   ```
+
+   ```shell
+    BEVFormer
+    ├── ckpts/
+    │   ├── r101_dcn_fcos3d_pretrain.pth
+   ```
+
+# 开始训练
+
+- 单机8卡训练（fp32训练精度）
+
+   ```shell
+   bash test/train_full_8p_base_fp32.sh
+   (option) bash test/train_full_8p_base_fp32.sh --epochs=4 --batch-size=1 --num-npu=8 # 8卡训练，默认训练24个epochs，这里只训练4个epochs
+   ```
+
+- 单机8卡训练（fp32训练性能）
+
+   ```shell
+   bash test/train_performance_8p_base_fp32.sh
+   (option) bash test/train_performance_8p_base_fp32.sh --batch-size=1 --num-npu=8 # 8卡性能
+   ```
+
+- 单机8卡训练（混合精度训练精度）
+
+   ```shell
+   bash test/train_full_8p_base_fp16.sh
+   (option) bash test/train_full_8p_base_fp16.sh --epochs=4 --batch-size=1 --num-npu=8 # 8卡训练，默认训练24个epochs，这里只训练4个epochs
+   ```
+
+- 单机8卡训练（混合精度训练性能）
+
+   ```shell
+   bash test/train_performance_8p_base_fp16.sh
+   (option) bash test/train_performance_8p_base_fp16.sh --batch-size=1 --num-npu=8 # 8卡性能
+   ```
+
+  模型训练脚本参数说明如下。
+
+   ```shell
+   公共参数：
+   --batch-size                             //指定batchsize，默认值为1
+   --num-npu                                //指定卡数，默认值为8
+   精度训练脚本参数：
+   --epochs                                 //指定训练epoch数，默认值为24
+   ```
+
+# 结果
+
+<table>
+  <thead>
+    <tr>
+      <th>NAME</th>
+      <th>Backbone</th>
+      <th>Method</th>
+      <th>训练方式</th>
+      <th>Epoch</th>
+      <th>global batch size</th>
+      <th>NDS</th>
+      <th>mAP</th>
+      <th>FPS</th>
+    </tr>
+  </thead>
+  <tbody>
+    <!-- FP32, batch 8 组 -->
+    <tr>
+      <td>8p-Atlas 800T A2</td>
+      <td>R101-DCN</td>
+      <td>BEVFormer-base</td>
+      <td>FP32</td>
+      <td>4</td>
+      <td>8</td>
+      <td>44.23</td>
+      <td>35.52</td>
+      <td>3.66</td>
+    </tr>
+    <tr style="border-bottom: 2px solid black;">
+      <td>8p-竞品A</td>
+      <td>R101-DCN</td>
+      <td>BEVFormer-base</td>
+      <td>FP32</td>
+      <td>4</td>
+      <td>8</td>
+      <td>43.58</td>
+      <td>34.45</td>
+      <td>3.32</td>
+    </tr>
+    <!-- FP32, batch 16 组 -->
+    <tr>
+      <td>8p-Atlas 800T A2</td>
+      <td>R101-DCN</td>
+      <td>BEVFormer-base</td>
+      <td>FP32</td>
+      <td>4</td>
+      <td>16</td>
+      <td>-</td>
+      <td>-</td>
+      <td>3.89</td>
+    </tr>
+    <tr style="border-bottom: 2px solid black;">
+      <td>8p-竞品A</td>
+      <td>R101-DCN</td>
+      <td>BEVFormer-base</td>
+      <td>FP32</td>
+      <td>4</td>
+      <td>16</td>
+      <td>-</td>
+      <td>-</td>
+      <td>3.39</td>
+    </tr>
+    <!-- 混合精度, batch 8 组 -->
+    <tr>
+      <td>8p-Atlas 800T A2</td>
+      <td>R101-DCN</td>
+      <td>BEVFormer-base</td>
+      <td>混合精度</td>
+      <td>4</td>
+      <td>8</td>
+      <td>46.23</td>
+      <td>37.92</td>
+      <td>3.33</td>
+    </tr>
+    <tr style="border-bottom: 2px solid black;">
+      <td>8p-竞品A</td>
+      <td>R101-DCN</td>
+      <td>BEVFormer-base</td>
+      <td>混合精度</td>
+      <td>4</td>
+      <td>8</td>
+      <td>44.50</td>
+      <td>34.05</td>
+      <td>3.75</td>
+    </tr>
+    <!-- A5数据 -->
+    <tr>
+      <td>8p-Atlas 950 SuperPoD </td>
+      <td>R101-DCN</td>
+      <td>BEVFormer-base</td>
+      <td>混合精度</td>
+      <td>4</td>
+      <td>8</td>
+      <td>46.12</td>
+      <td>38.46</td>
+      <td>11.64</td>
+    </tr>
+  </tbody>
+</table>
+
+# 版本说明
+
+## 变更
+
+2024.3.8：首次发布。
+
+2025.1.6：更新发布。
+
+2025.2.6：更新性能数据。
+
+2025.4.23：base模型支持混合精度训练。
+
+2025.8.7：增加batch_size=2性能，更新性能数据。
+
+2026.1.19：更新对预处理数据集时出现的问题的处理办法。
+
+2026.5.12：更新A5上的模型适配步骤。
+
+## FAQ
+
+1、若执行数据预处理脚本过程中出现`ModuleNotFoundError: No module named 'tools.data_converter'`问题，参考bevformer 原仓的 issue（ <https://github.com/fundamentalvision/BEVFormer/issues/223> 或者 <https://github.com/fundamentalvision/BEVFormer/pull/241> ）进行处理。

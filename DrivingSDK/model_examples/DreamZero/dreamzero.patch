@@ -1,0 +1,685 @@
+diff --git a/groot/vla/experiment/experiment.py b/groot/vla/experiment/experiment.py
+index e02d36c..001f7d9 100644
+--- a/groot/vla/experiment/experiment.py
++++ b/groot/vla/experiment/experiment.py
+@@ -8,6 +8,46 @@ import numpy as np
+ from omegaconf import DictConfig
+ import torch
+ 
++# NPU environment variables (NOT including ALLOW_INTERNAL_FORMAT).
++os.environ.setdefault("COMBINED_ENABLE", "1")
++os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
++os.environ.setdefault("ENABLE_TENSORRT", "False")
++os.environ.setdefault("ATTENTION_BACKEND", "torch")
++os.environ.setdefault("NCCL_VERSION", "")
++
++import torch_npu
++from torch_npu.contrib import transfer_to_npu
++from mx_driving.patcher import default_patcher
++
++# Block GPU-only libraries BEFORE DreamZero module imports (matches
++# monkey-patch skip_import at patch.py:901). Without this,
++# transformer_engine/flash_attn get imported (CUDA versions) and corrupt
++# tensor format handling, causing aclnnCat 161002 (ND vs NCL mismatch).
++default_patcher.skip_import(
++    "transformer_engine",
++    "transformer_engine_torch",
++    "flash_attn",
++    "flash_attn_interface",
++    "sageattention",
++)
++
++# Add __version__ to stubs: DreamZero's cudnn_attention.py reads
++# transformer_engine.__version__ during import.
++import sys as _sys, importlib.machinery as _machinery
++for _name in ("transformer_engine", "transformer_engine_torch"):
++    _mod = _sys.modules.get(_name)
++    if _mod is not None and not hasattr(_mod, "__version__"):
++        _mod.__version__ = "0.0.0"
++        if getattr(_mod, "__spec__", None) is None:
++            _mod.__spec__ = _machinery.ModuleSpec(_name, loader=None, is_package=True)
++
++# Apply NPU patches BEFORE DreamZero imports (matches monkey-patch:
++# apply() at train_npu.py:60 before runpy.run_path at :69). Redirects
++# torch.cuda.* to torch_npu.npu.* so modules never capture unpatched CUDA.
++default_patcher.apply()
++
++torch_npu.npu.set_compile_mode(jit_compile=False)
++
+ from groot.vla.experiment.base import BaseExperiment, BaseTrainer
+ from groot.vla.utils.action_args_override_utils import apply_action_overrides
+ 
+diff --git a/groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py b/groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py
+index b7cd806..fcdd8a5 100644
+--- a/groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py
++++ b/groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py
+@@ -17,6 +17,12 @@ from safetensors.torch import load_file
+ import json
+ from huggingface_hub import hf_hub_download
+ 
++try:
++    import torch_npu
++    _npu_available = torch_npu.npu.is_available()
++except ImportError:
++    _npu_available = False
++
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -203,7 +209,7 @@ class WANPolicyHead(ActionHead):
+         self.ip_size = 1
+         self.ip_group = None
+         
+-        self._device = "cuda"
++        self._device = "npu" if _npu_available else "cuda"
+         self.dynamic_cache_schedule = os.getenv("DYNAMIC_CACHE_SCHEDULE", "False").lower() == "true"
+ 
+ 
+@@ -792,7 +798,7 @@ class WANPolicyHead(ActionHead):
+                 action_loss_per_sample = torch.nn.functional.mse_loss(
+                     action_noise_pred.float(), training_target_action.float(), reduction='none'
+                 ) * action_mask  # shape: [B, ...]
+-                action_loss_per_sample = has_real_action[:, None].float() * action_loss_per_sample  # apply has_real_action
++                action_loss_per_sample = has_real_action[:, None, None].float() * action_loss_per_sample  # apply has_real_action
+                 weight_action = action_loss_per_sample.mean(dim=2) * self.scheduler.training_weight(
+                     timestep_action.flatten(0, 1),
+                 ).unflatten(0, (noise_action.shape[0], noise_action.shape[1])).to(self._device)
+@@ -813,6 +819,8 @@ class WANPolicyHead(ActionHead):
+         return BatchFeature(data=output_dict)
+ 
+     def generate_noise(self, shape, seed=None, device="cpu", dtype=torch.float16):
++        if _npu_available and isinstance(device, str) and device == "cuda":
++            device = "npu"
+         generator = None if seed is None else torch.Generator(device).manual_seed(seed)
+         noise = torch.randn(shape, generator=generator, device=device, dtype=dtype)
+         return noise
+diff --git a/groot/vla/model/dreamzero/modules/attention.py b/groot/vla/model/dreamzero/modules/attention.py
+index 0ebc62a..79a56c7 100644
+--- a/groot/vla/model/dreamzero/modules/attention.py
++++ b/groot/vla/model/dreamzero/modules/attention.py
+@@ -2,6 +2,12 @@
+ import torch
+ import os
+ 
++try:
++    import torch_npu
++    _npu_available = torch_npu.npu.is_available()
++except ImportError:
++    _npu_available = False
++
+ try:
+     import flash_attn_interface
+     FLASH_ATTN_3_AVAILABLE = True
+@@ -25,6 +31,8 @@ __all__ = [
+ 
+ def _gpu_supports_flash_attention():
+     """FlashAttention requires Ampere (compute capability 8.0) or newer."""
++    if _npu_available:
++        return True
+     if not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
+         return False
+     try:
+@@ -93,6 +101,36 @@ def flash_attention(
+     deterministic:  bool. If True, slightly slower and uses more memory.
+     dtype:          torch.dtype. Apply when dtype of q/k/v is not float16/bfloat16.
+     """
++    if _npu_available:
++        import torch_npu
++        out_dtype = q.dtype
++        q_in = q.to(dtype)
++        k_in = k.to(dtype)
++        v_in = v.to(dtype)
++        if q_scale is not None:
++            q_in = q_in * q_scale
++        scale = softmax_scale if softmax_scale is not None else q_in.shape[-1] ** (-0.5)
++        q_len = q_in.shape[1]
++        kv_len = k_in.shape[1]
++        if causal and q_len != kv_len:
++            qt = q_in.transpose(1, 2)
++            kt = k_in.transpose(1, 2)
++            vt = v_in.transpose(1, 2)
++            out = torch.nn.functional.scaled_dot_product_attention(
++                qt, kt, vt, attn_mask=None, is_causal=True,
++                dropout_p=dropout_p, scale=scale,
++            )
++            return out.transpose(1, 2).contiguous().to(out_dtype)
++        num_heads = q_in.shape[2]
++        sparse_mode = 1 if (causal and q_len == kv_len) else 0
++        out = torch_npu.npu_fusion_attention(
++            q_in, k_in, v_in, num_heads,
++            input_layout="BSND", pre_tockens=65536, next_tockens=65536,
++            atten_mask=None, scale=scale, keep_prob=1.0 - dropout_p,
++            sync=False, inner_precise=0, sparse_mode=sparse_mode,
++        )[0]
++        return out.to(out_dtype)
++
+     half_dtypes = (torch.float16, torch.bfloat16)
+     assert dtype in half_dtypes
+     assert q.device.type == 'cuda' and q.size(-1) <= 256
+diff --git a/groot/vla/model/dreamzero/modules/flow_unipc_multistep_scheduler.py b/groot/vla/model/dreamzero/modules/flow_unipc_multistep_scheduler.py
+index df7ea56..614d147 100644
+--- a/groot/vla/model/dreamzero/modules/flow_unipc_multistep_scheduler.py
++++ b/groot/vla/model/dreamzero/modules/flow_unipc_multistep_scheduler.py
+@@ -14,6 +14,12 @@ from diffusers.schedulers.scheduling_utils import (
+     SchedulerOutput,
+ )
+ 
++try:
++    import torch_npu
++    _npu_available = torch_npu.npu.is_available()
++except ImportError:
++    _npu_available = False
++
+ 
+ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
+     """
+@@ -105,7 +111,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
+         alphas = np.linspace(1, 1 / num_train_timesteps,
+                              num_train_timesteps)[::-1].copy()
+         sigmas = 1.0 - alphas
+-        sigmas = torch.from_numpy(sigmas).to(dtype=torch.float32, device='cuda')
++        sigmas = torch.from_numpy(sigmas).to(dtype=torch.float32, device='npu' if _npu_available else 'cuda')
+ 
+         if not use_dynamic_shifting:
+             # when use_dynamic_shifting is True, we apply the timestep shifting on the fly based on the image resolution
+@@ -114,6 +120,8 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
+ 
+         self.sigmas = sigmas
+         self.timesteps = sigmas * num_train_timesteps
++        if _npu_available:
++            self.timesteps = self.timesteps.to('npu')
+ 
+         self.model_outputs = [None] * solver_order
+         self.timestep_list = [None] * solver_order
+diff --git a/groot/vla/model/dreamzero/modules/wan2_1_attention.py b/groot/vla/model/dreamzero/modules/wan2_1_attention.py
+index 5ffb826..32d11fb 100644
+--- a/groot/vla/model/dreamzero/modules/wan2_1_attention.py
++++ b/groot/vla/model/dreamzero/modules/wan2_1_attention.py
+@@ -7,10 +7,18 @@ import time
+ from typing import Optional
+ import os
+ 
++try:
++    import torch_npu
++    _npu_available = torch_npu.npu.is_available()
++except ImportError:
++    _npu_available = False
++
+ try:
+     import flash_attn_interface
+ 
+     def is_hopper_gpu():
++        if _npu_available:
++            return False
+         if not torch.cuda.is_available():
+             return False
+         device_name = torch.cuda.get_device_name(0).lower()
+@@ -109,6 +117,36 @@ def flash_attention(
+     Returns:
+         x:              [B, Lq, Nq, C2].
+     """
++    if _npu_available:
++        import torch_npu
++        out_dtype = q.dtype
++        q_in = q.to(dtype)
++        k_in = k.to(dtype)
++        v_in = v.to(dtype)
++        if q_scale is not None:
++            q_in = q_in * q_scale
++        scale = softmax_scale if softmax_scale is not None else q_in.shape[-1] ** (-0.5)
++        q_len = q_in.shape[1]
++        kv_len = k_in.shape[1]
++        if causal and q_len != kv_len:
++            qt = q_in.transpose(1, 2)
++            kt = k_in.transpose(1, 2)
++            vt = v_in.transpose(1, 2)
++            out = torch.nn.functional.scaled_dot_product_attention(
++                qt, kt, vt, attn_mask=None, is_causal=True,
++                dropout_p=dropout_p, scale=scale,
++            )
++            return out.transpose(1, 2).contiguous().to(out_dtype)
++        num_heads = q_in.shape[2]
++        sparse_mode = 1 if (causal and q_len == kv_len) else 0
++        out = torch_npu.npu_fusion_attention(
++            q_in, k_in, v_in, num_heads,
++            input_layout="BSND", pre_tockens=65536, next_tockens=65536,
++            atten_mask=None, scale=scale, keep_prob=1.0 - dropout_p,
++            sync=False, inner_precise=0, sparse_mode=sparse_mode,
++        )[0]
++        return out.to(out_dtype)
++
+     if window_size is None:
+         window_size = (-1, -1)
+     if version is None:
+@@ -220,6 +258,9 @@ class AttentionModule(torch.nn.Module):
+         if backend is None:
+             backend = "torch"
+ 
++        if _npu_available:
++            backend = "torch"
++
+         if os.getenv("ATTENTION_BACKEND") is not None:
+             backend = os.getenv("ATTENTION_BACKEND")
+         else:
+@@ -237,6 +278,12 @@ class AttentionModule(torch.nn.Module):
+         assert backend in ["torch", "FA2", "FA3", "TE", "torch_onnx"]
+         self.backend = backend
+ 
++        self._dz_num_heads = num_heads
++        self._dz_dropout_p = float(dropout_p)
++        self._dz_softmax_scale = softmax_scale
++        self._dz_causal = bool(causal)
++        self._dz_dtype = dtype
++
+         if backend == "torch":
+             def _torch_impl(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+                 out_dtype = q.dtype
+@@ -334,6 +381,37 @@ class AttentionModule(torch.nn.Module):
+         q_lens: Optional[torch.Tensor] = None,
+         k_lens: Optional[torch.Tensor] = None,
+     ):
++        if _npu_available:
++            import torch_npu
++            out_dtype = q.dtype
++            q_in = q.to(self._dz_dtype if hasattr(self, '_dz_dtype') else torch.bfloat16)
++            k_in = k.to(q_in.dtype)
++            v_in = v.to(q_in.dtype)
++            scale = getattr(self, '_dz_softmax_scale', None) or q_in.shape[-1] ** (-0.5)
++            causal = getattr(self, '_dz_causal', False)
++            dropout_p = getattr(self, '_dz_dropout_p', 0.0) if self.training else 0.0
++            q_len = q_in.shape[1]
++            kv_len = k_in.shape[1]
++
++            if causal and q_len != kv_len:
++                qt = q_in.transpose(1, 2)
++                kt = k_in.transpose(1, 2)
++                vt = v_in.transpose(1, 2)
++                out = torch.nn.functional.scaled_dot_product_attention(
++                    qt, kt, vt, attn_mask=None, is_causal=True,
++                    dropout_p=dropout_p, scale=scale,
++                )
++                return out.transpose(1, 2).contiguous().to(out_dtype)
++
++            sparse_mode = 1 if (causal and q_len == kv_len) else 0
++            out = torch_npu.npu_fusion_attention(
++                q_in, k_in, v_in, self._dz_num_heads,
++                input_layout="BSND", pre_tockens=65536, next_tockens=65536,
++                atten_mask=None, scale=scale, keep_prob=1.0 - dropout_p,
++                sync=False, inner_precise=0, sparse_mode=sparse_mode,
++            )[0]
++            return out.to(out_dtype)
++
+         if (
+             self.backend == "torch" or
+             self.backend == "torch_onnx" or
+diff --git a/groot/vla/model/dreamzero/modules/wan2_1_submodule.py b/groot/vla/model/dreamzero/modules/wan2_1_submodule.py
+index b7bbe11..41d79bc 100644
+--- a/groot/vla/model/dreamzero/modules/wan2_1_submodule.py
++++ b/groot/vla/model/dreamzero/modules/wan2_1_submodule.py
+@@ -9,6 +9,12 @@ from diffusers.models.modeling_utils import ModelMixin
+ from einops import repeat
+ from groot.vla.model.dreamzero.modules.attention import flash_attention
+ 
++try:
++    import torch_npu
++    _npu_available = torch_npu.npu.is_available()
++except ImportError:
++    _npu_available = False
++
+ __all__ = ['WanModel']
+ 
+ ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
+@@ -27,7 +33,7 @@ def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
+ 
+ 
+ def rope_params(max_seq_len, dim, theta=10000):
+-    if ENABLE_TENSORRT:
++    if _npu_available or ENABLE_TENSORRT:
+         return rope_params_no_polar(max_seq_len, dim, theta)
+     else:
+         return rope_params_polar(max_seq_len, dim, theta)
+@@ -55,7 +61,7 @@ def rope_params_no_polar(max_seq_len: int, dim: int, theta: float = 10000) -> to
+     return emb
+ 
+ def rope_apply(x, grid_sizes, freqs):
+-    if ENABLE_TENSORRT:
++    if _npu_available or ENABLE_TENSORRT:
+         return rope_apply_no_polar(x, freqs)
+     else:
+         return rope_apply_polar(x, freqs)
+@@ -90,7 +96,7 @@ def rope_apply_no_polar(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+ 
+ 
+ def rope_action_apply(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block=32, num_state_per_block=1):
+-    if ENABLE_TENSORRT:
++    if _npu_available or ENABLE_TENSORRT:
+         return rope_action_apply_no_polar(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block, num_state_per_block)
+     else:
+         return rope_action_apply_polar(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block, num_state_per_block)
+@@ -105,25 +111,38 @@ def rope_action_apply_no_polar(
+     num_action_per_block: int = 32,
+     num_state_per_block: int = 1,
+ ) -> torch.Tensor:
+-    B, seq_len, n, D = x.shape
++    B, seq_len, n, d = x.shape
++
++    if freqs.dim() == 3 and freqs.shape[1] == 1:
++        freqs = freqs.squeeze(1)
++    freqs = freqs.to(device=x.device, dtype=torch.float32).contiguous()
+ 
+     if action_register_length is not None:
+         chunk_size = action_register_length // (num_action_per_block + num_state_per_block)
+-        freqs_1d_action = freqs_action[:chunk_size * num_action_per_block]
+-        freqs_1d_state = freqs_state[:chunk_size * num_state_per_block]
+-        freqs = torch.cat([freqs, freqs_1d_action, freqs_1d_state], dim=0)
++        freqs_action = freqs_action[:chunk_size * num_action_per_block]
++        freqs_state = freqs_state[:chunk_size * num_state_per_block]
++        if freqs_action.dim() == 3 and freqs_action.shape[1] == 1:
++            freqs_action = freqs_action.squeeze(1)
++        if freqs_state.dim() == 3 and freqs_state.shape[1] == 1:
++            freqs_state = freqs_state.squeeze(1)
++        freqs_action = freqs_action.to(device=x.device, dtype=freqs.dtype).contiguous()
++        freqs_state = freqs_state.to(device=x.device, dtype=freqs.dtype).contiguous()
++        freqs = torch.cat([freqs, freqs_action, freqs_state], dim=0).contiguous()
+ 
+-    # Reshape freqs to be broadcastable: (1, seq_len, 1, D)
+-    freqs = freqs.unsqueeze(0).unsqueeze(2)
++    freqs = freqs[: x.shape[1]]
+ 
+-    x0, x1 = x.chunk(2, dim=-1)
+-    freqs_cos, freqs_sin = freqs.chunk(2, dim=-1)
++    x = x.reshape(B, seq_len, n, -1, 2)
++    x_real = x[..., 0]
++    x_imag = x[..., 1]
++    freqs = freqs.unsqueeze(0).unsqueeze(2).view(1, freqs.shape[0], 1, -1, 2)
++    freqs_cos = freqs[..., 0].to(dtype=x_real.dtype)
++    freqs_sin = freqs[..., 1].to(dtype=x_real.dtype)
+ 
+-    rotated_x0 = x0 * freqs_cos - x1 * freqs_sin
+-    rotated_x1 = x1 * freqs_cos + x0 * freqs_sin
+-    x_rotated = torch.cat((rotated_x0, rotated_x1), dim=-1)
++    x_real_rotated = x_real * freqs_cos - x_imag * freqs_sin
++    x_imag_rotated = x_real * freqs_sin + x_imag * freqs_cos
+ 
+-    return x_rotated
++    x_rotated = torch.stack((x_real_rotated, x_imag_rotated), dim=-1)
++    return x_rotated.flatten(3).contiguous()
+ 
+ 
+ # @amp.autocast(enabled=False)
+@@ -172,6 +191,10 @@ class WanRMSNorm(nn.Module):
+         Args:
+             x(Tensor): Shape [B, L, C]
+         """
++        if _npu_available:
++            import torch_npu
++            w = self.weight.to(x.dtype)
++            return torch_npu.npu_rms_norm(x, w, epsilon=self.eps)[0]
+         return self._norm(x.float()).type_as(x) * self.weight
+ 
+     def _norm(self, x):
+diff --git a/groot/vla/model/dreamzero/modules/wan_video_dit.py b/groot/vla/model/dreamzero/modules/wan_video_dit.py
+index 305d320..82e5910 100644
+--- a/groot/vla/model/dreamzero/modules/wan_video_dit.py
++++ b/groot/vla/model/dreamzero/modules/wan_video_dit.py
+@@ -7,6 +7,13 @@ from typing import Tuple, Optional
+ from einops import rearrange
+ from groot.vla.model.dreamzero.modules.utils import hash_state_dict_keys
+ from groot.vla.model.dreamzero.modules.wan_video_camera_controller import SimpleAdapter
++
++try:
++    import torch_npu
++    _npu_available = torch_npu.npu.is_available()
++except ImportError:
++    _npu_available = False
++
+ try:
+     import flash_attn_interface
+     FLASH_ATTN_3_AVAILABLE = True
+@@ -52,7 +59,7 @@ else:
+     FLASH_ATTN_COMPATIBILITY_MODE = False
+ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
+     # Use PyTorch SDPA on pre-Ampere GPUs or when compatibility_mode (FlashAttention requires Ampere or newer)
+-    if compatibility_mode or not _gpu_supports_flash_attention():
++    if _npu_available or compatibility_mode or not _gpu_supports_flash_attention():
+         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+@@ -87,12 +94,12 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
+     return x
+ 
+ 
+-@torch.compile(disable=DISABLE_TORCH_COMPILE)
++@torch.compile(disable=DISABLE_TORCH_COMPILE or _npu_available)
+ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
+     return (x * (1 + scale) + shift)
+ 
+ 
+-@torch.compile(disable=DISABLE_TORCH_COMPILE)
++@torch.compile(disable=DISABLE_TORCH_COMPILE or _npu_available)
+ def sinusoidal_embedding_1d(dim, position):
+     sinusoid = torch.outer(
+         position.type(torch.float64),
+@@ -101,7 +108,7 @@ def sinusoidal_embedding_1d(dim, position):
+     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
+     return x.to(position.dtype)
+ 
+-@torch.compile(disable=DISABLE_TORCH_COMPILE)
++@torch.compile(disable=DISABLE_TORCH_COMPILE or _npu_available)
+ def rope_apply_no_polar_op(x, freqs_cis, num_heads):
+     freqs_cos, freqs_sin = freqs_cis
+ 
+@@ -120,7 +127,7 @@ def rope_apply_no_polar_op(x, freqs_cis, num_heads):
+     return rearrange(x_out, "b s h d -> b s (h d)").to(x.dtype)
+ 
+ 
+-@torch.compile(disable=DISABLE_TORCH_COMPILE)
++@torch.compile(disable=DISABLE_TORCH_COMPILE or _npu_available)
+ def rope_apply_polar_op(x, freqs, num_heads):
+     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
+     x_out = torch.view_as_complex(x.to(torch.float64).reshape(
+@@ -140,6 +147,10 @@ class RMSNorm(nn.Module):
+         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+ 
+     def forward(self, x):
++        if _npu_available:
++            import torch_npu
++            w = self.weight.to(x.dtype)
++            return torch_npu.npu_rms_norm(x, w, epsilon=self.eps)[0]
+         dtype = x.dtype
+         return self.norm(x.float()).to(dtype) * self.weight
+ 
+@@ -208,7 +219,7 @@ class RotaryPositionEmbeddingNoPolarOp(nn.Module):
+ 
+     def post_initialize(self):
+         self.freqs = {
+-            key: (value[0].to("cuda"), value[1].to("cuda")) for key, value in self.freqs.items()
++            key: (value[0].to("npu" if _npu_available else "cuda"), value[1].to("npu" if _npu_available else "cuda")) for key, value in self.freqs.items()
+         }
+ 
+ 
+@@ -246,7 +257,7 @@ class RotaryPositionEmbeddingWithPolarOp(nn.Module):
+         return freqs
+ 
+     def post_initialize(self):
+-        self.freqs = {key: value.to(device="cuda") for key, value in self.freqs.items()}
++        self.freqs = {key: value.to(device="npu" if _npu_available else "cuda") for key, value in self.freqs.items()}
+ 
+ 
+ class AttentionModule(nn.Module):
+@@ -328,7 +339,7 @@ class GateModule(nn.Module):
+     def __init__(self,):
+         super().__init__()
+ 
+-    @torch.compile(disable=DISABLE_TORCH_COMPILE)
++    @torch.compile(disable=DISABLE_TORCH_COMPILE or _npu_available)
+     def forward(self, x, gate, residual):
+         return x + gate * residual
+ 
+diff --git a/groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py b/groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py
+index c5e2528..a5a68e9 100644
+--- a/groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py
++++ b/groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py
+@@ -11,6 +11,7 @@ from groot.vla.model.dreamzero.modules.wan2_1_submodule import (
+     WanLayerNorm,
+     WAN_CROSSATTENTION_CLASSES,
+     rope_params,
++    rope_params_no_polar,
+     MLPProj,
+     sinusoidal_embedding_1d
+ )
+@@ -25,6 +26,12 @@ import math
+ import torch.distributed as dist
+ import os
+ 
++try:
++    import torch_npu
++    _npu_available = torch_npu.npu.is_available()
++except ImportError:
++    _npu_available = False
++
+ ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
+ 
+ 
+@@ -91,7 +98,7 @@ class MultiEmbodimentActionEncoder(nn.Module):
+ 
+ 
+ def causal_rope_action_apply(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block, num_state_per_block, action_state_index):
+-    if ENABLE_TENSORRT:
++    if _npu_available or ENABLE_TENSORRT:
+         return causal_rope_action_apply_no_polar(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block, num_state_per_block, action_state_index)
+     else:
+         return causal_rope_action_apply_polar(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block, num_state_per_block, action_state_index)
+@@ -1410,12 +1417,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
+         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
+         d = dim // num_heads
+         
+-        self.freqs_action = rope_params(1024*10, d)
+-        self.freqs_state = rope_params(1024, d)
++        self.freqs_action = rope_params_no_polar(1024*10, d) if _npu_available else rope_params(1024*10, d)
++        self.freqs_state = rope_params_no_polar(1024, d) if _npu_available else rope_params(1024, d)
+         self.freqs = [
+-            rope_params(1024, d - 4 * (d // 6)),
+-            rope_params(1024, 2 * (d // 6)),
+-            rope_params(1024, 2 * (d // 6)),
++            rope_params_no_polar(1024, d - 4 * (d // 6)) if _npu_available else rope_params(1024, d - 4 * (d // 6)),
++            rope_params_no_polar(1024, 2 * (d // 6)) if _npu_available else rope_params(1024, 2 * (d // 6)),
++            rope_params_no_polar(1024, 2 * (d // 6)) if _npu_available else rope_params(1024, 2 * (d // 6)),
+         ]
+         if model_type in ('i2v', 'ti2v'):
+             self.img_emb = MLPProj(1280, dim)
+diff --git a/pyproject.toml b/pyproject.toml
+index cec38dd..78d8f7b 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -19,10 +19,10 @@ authors = [
+ ]
+ requires-python = "~=3.11,<3.13"
+ dependencies = [
+     "av==15.0.0",
+-    "torch==2.8.0",
+-    "torchvision==0.23.0",
+-    "torchaudio==2.8.0",
++    "torch==2.7.1",
++    "torchvision==0.22.1",
++    "torchaudio==2.7.1",
+     "pyttsx3==2.90",
+     "scipy==1.15.3",
+     "numpy==1.26.4",
+@@ -74,13 +74,10 @@ dependencies = [
+     "opencv-python==4.8.0.74",
+     "diffusers==0.30.2",
+     "ftfy",
+-    "nvidia-modelopt",
+-    "nvidia-modelopt-core",
+-    "tensorrt",
+     "openpi-client==0.1.1",
+     "huggingface_hub",
+     "decord2",
+-    "deepspeed",
++    "deepspeed==0.19.2",
+     "tiktoken",
+     "sentencepiece"
+ ]
+diff --git a/socket_test_optimized_AR.py b/socket_test_optimized_AR.py
+index 5b93e05..b48b5c4 100644
+--- a/socket_test_optimized_AR.py
++++ b/socket_test_optimized_AR.py
+@@ -8,6 +8,24 @@ import logging
+ import time
+ import traceback
+ import torch
++import torch_npu
++from torch_npu.contrib import transfer_to_npu
++from mx_driving.patcher import default_patcher
++
++_npu_available = torch_npu.npu.is_available()
++
++# Block GPU-only libraries before DreamZero imports (same as training path).
++default_patcher.skip_import(
++    "transformer_engine",
++    "transformer_engine_torch",
++    "flash_attn",
++    "flash_attn_interface",
++    "sageattention",
++)
++
++# Apply NPU patches before DreamZero module imports.
++default_patcher.apply()
++
+ import tyro
+ from einops import rearrange
+ import datetime
+@@ -713,16 +731,16 @@ class WebsocketPolicyServer:
+ 
+ def init_mesh() -> DeviceMesh:
+     # env vars set by torchrun
+-    dist.init_process_group("nccl")
++    dist.init_process_group("hccl")
+     rank = dist.get_rank()
+     world_size = dist.get_world_size()
+     print(f"Rank {rank}/{world_size} (PID: {os.getpid()}) setting device to {rank}")
+ 
+-    torch.cuda.set_device(rank)
+-    device = torch.device(f"cuda:{rank}")
++    torch.npu.set_device(rank)
++    device = torch.device(f"npu:{rank}")
+ 
+     mesh = init_device_mesh(
+-        device_type="cuda",
++        device_type="npu",
+         mesh_shape=(world_size, ),
+         mesh_dim_names=("ip", ),
+     )
+@@ -741,8 +759,8 @@ def main(args: Args) -> None:
+     # Set environment variable for DIT cache.
+     os.environ["ENABLE_DIT_CACHE"] = "true" if args.enable_dit_cache else "false"
+ 
+-    # Use TE cuDNN backend for attention.
+-    os.environ["ATTENTION_BACKEND"] = "TE"
++    # Use torch backend for attention on NPU.
++    os.environ["ATTENTION_BACKEND"] = "torch"
+ 
+     # Increase the recompile limit to 100 for inference due
+     # to autoregressive nature of the model (several possible shapes).
+@@ -766,7 +784,7 @@ def main(args: Args) -> None:
+     policy = GrootSimPolicy(
+         embodiment_tag=EmbodimentTag(embodiment_tag),
+         model_path=model_path,
+-        device="cuda" if torch.cuda.is_available() else "cpu",
++        device="npu" if torch.npu.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"),
+         device_mesh=device_mesh,
+     )
+ 
+@@ -796,8 +814,10 @@ def main(args: Args) -> None:
+     )
+     
+     # Configure server for AR_droid (2 external cameras, wrist camera, joint position actions)
++    # Wan2.2 5B uses 160x320 (not 180x320) for VAE38 latent alignment
++    _img_h, _img_w = (160, 320) if _npu_available else (180, 320)
+     server_config = PolicyServerConfig(
+-        image_resolution=(180, 320),  # AR_droid expects 180x320 images
++        image_resolution=(_img_h, _img_w),
+         needs_wrist_camera=True,
+         n_external_cameras=2,
+         needs_stereo_camera=False,

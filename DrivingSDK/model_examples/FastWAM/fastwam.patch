@@ -1,0 +1,449 @@
+diff --git a/configs/task/libero_uncond_2cam224_1e-4.yaml b/configs/task/libero_uncond_2cam224_1e-4.yaml
+index 37c27d7..ac39554 100644
+--- a/configs/task/libero_uncond_2cam224_1e-4.yaml
++++ b/configs/task/libero_uncond_2cam224_1e-4.yaml
+@@ -19,7 +19,7 @@ num_epochs: 10
+ max_steps: null
+ log_every: 10
+ save_every: 2000
+-eval_every: 200
++eval_every: 1000
+ 
+ # training
+ gradient_accumulation_steps: 1
+diff --git a/pyproject.toml b/pyproject.toml
+index 22ed494..22df5bf 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -12,7 +12,7 @@ dependencies = [
+   "av==16.0.1",
+   "boto3==1.35.99",
+   "datasets==3.6.0",
+-  "deepspeed==0.18.5",
++  "deepspeed==0.14.4",
+   "einops==0.8.1",
+   "gitpython==3.1.45",
+   "huggingface-hub==0.29.2",
+@@ -31,9 +31,6 @@ dependencies = [
+   "rich==14.2.0",
+   "safetensors==0.5.3",
+   "termcolor==2.5.0",
+-  "torch==2.7.1+cu128",
+-  "torchcodec==0.5",
+-  "torchvision==0.22.1+cu128",
+   "tqdm==4.66.5",
+   "transformers==4.49.0",
+   "typing-extensions==4.15.0",
+diff --git a/scripts/ds_configs/ds_zero1_config.json b/scripts/ds_configs/ds_zero1_config.json
+index 5c9bea2..3db415d 100644
+--- a/scripts/ds_configs/ds_zero1_config.json
++++ b/scripts/ds_configs/ds_zero1_config.json
+@@ -10,9 +10,9 @@
+     "offload_param": {
+       "device": "none"
+     },
+-    "overlap_comm": false,
+-    "contiguous_gradients": false,
+-    "reduce_bucket_size": 2e8,
+-    "allgather_bucket_size": 2e8
++    "overlap_comm": true,
++    "contiguous_gradients": true,
++    "reduce_bucket_size": 5e7,
++    "allgather_bucket_size": 5e7
+   }
+ }
+diff --git a/scripts/preprocess_action_dit_backbone.py b/scripts/preprocess_action_dit_backbone.py
+index 737f9c0..2fbaf50 100644
+--- a/scripts/preprocess_action_dit_backbone.py
++++ b/scripts/preprocess_action_dit_backbone.py
+@@ -3,6 +3,9 @@ from pathlib import Path
+ from typing import Any
+ 
+ import torch
++# NPU适配
++import torch_npu
++from torch_npu.contrib import transfer_to_npu
+ import torch.nn.functional as F
+ from omegaconf import OmegaConf
+ 
+diff --git a/scripts/train.py b/scripts/train.py
+index 9f91819..8a3e605 100644
+--- a/scripts/train.py
++++ b/scripts/train.py
+@@ -1,6 +1,10 @@
+ import hydra
+ from omegaconf import DictConfig
+ 
++# NPU适配
++import torch_npu
++from torch_npu.contrib import transfer_to_npu
++
+ from fastwam.runtime import run_training
+ from fastwam.utils.config_resolvers import register_default_resolvers
+ 
+diff --git a/src/fastwam/models/wan22/fastwam.py b/src/fastwam/models/wan22/fastwam.py
+index 106beb3..6c81b6b 100644
+--- a/src/fastwam/models/wan22/fastwam.py
++++ b/src/fastwam/models/wan22/fastwam.py
+@@ -562,8 +562,8 @@ class FastWAM(torch.nn.Module):
+ 
+         loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
+         loss_dict = {
+-            "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
+-            "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
++            "loss_video": self.loss_lambda_video * float(loss_video.detach()),
++            "loss_action": self.loss_lambda_action * float(loss_action.detach()),
+         }
+         return loss_total, loss_dict
+ 
+diff --git a/src/fastwam/models/wan22/wan_video_dit.py b/src/fastwam/models/wan22/wan_video_dit.py
+index 01dc2a0..d27f473 100644
+--- a/src/fastwam/models/wan22/wan_video_dit.py
++++ b/src/fastwam/models/wan22/wan_video_dit.py
+@@ -1,6 +1,7 @@
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
++import torch_npu
+ import math
+ from typing import Any, Dict, Tuple, Optional
+ from einops import rearrange
+@@ -54,7 +55,7 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
+ 
+ def rope_apply(x, freqs, num_heads):
+     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
+-    x_out = torch.view_as_complex(x.to(torch.float64).reshape(
++    x_out = torch.view_as_complex(x.to(torch.float32).reshape(
+         x.shape[0], x.shape[1], x.shape[2], -1, 2))
+     freqs = freqs.to(torch.complex64) if freqs.device.type == "npu" else freqs
+     x_out = torch.view_as_real(x_out * freqs).flatten(2)
+@@ -144,18 +145,36 @@ def create_group_causal_attn_mask(
+     return attn_mask
+ 
+ 
+-class RMSNorm(nn.Module):
+-    def __init__(self, dim, eps=1e-5):
++class RMSNorm(torch.nn.Module):
++    def __init__(self, dim: int, eps: float = 1e-6):
++        """
++        Initialize the RMSNorm normalization layer.
++
++        Args:
++            dim (int): The dimension of the input tensor.
++            eps (float, optional): A small value added to the denominator for numerical stability. Default is 1e-6.
++
++        Attributes:
++            eps (float): A small value added to the denominator for numerical stability.
++            weight (nn.Parameter): Learnable scaling parameter.
++
++        """
+         super().__init__()
+         self.eps = eps
+         self.weight = nn.Parameter(torch.ones(dim))
+ 
+-    def norm(self, x):
+-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+-
+     def forward(self, x):
+-        dtype = x.dtype
+-        return self.norm(x.float()).to(dtype) * self.weight
++        """
++        Forward pass through the RMSNorm layer.
++
++        Args:
++            x (torch.Tensor): The input tensor.
++
++        Returns:
++            torch.Tensor: The output tensor after applying RMSNorm.
++
++        """
++        return torch_npu.npu_rms_norm(x, self.weight, epsilon=self.eps)[0]
+ 
+ 
+ class AttentionModule(nn.Module):
+diff --git a/src/fastwam/models/wan22/wan_video_vae.py b/src/fastwam/models/wan22/wan_video_vae.py
+index 0386bde..48fbcaf 100644
+--- a/src/fastwam/models/wan22/wan_video_vae.py
++++ b/src/fastwam/models/wan22/wan_video_vae.py
+@@ -4,6 +4,8 @@ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+ from tqdm import tqdm
++import math
++import torch_npu
+ 
+ CACHE_T = 2
+ 
+diff --git a/src/fastwam/trainer.py b/src/fastwam/trainer.py
+index 75e0f2e..d670d47 100644
+--- a/src/fastwam/trainer.py
++++ b/src/fastwam/trainer.py
+@@ -9,8 +9,10 @@ import time
+ 
+ import numpy as np
+ import torch
++import torch_npu
+ from accelerate import Accelerator
+ from omegaconf import DictConfig
++from collections import deque
+ from PIL import Image
+ from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
+ from torch.utils.data import DataLoader
+@@ -656,6 +658,10 @@ class Wan22Trainer:
+         self.run_start_step = self.global_step
+         self.run_start_time = time.perf_counter()
+ 
++        # 最近 log_every 个 step 的性能窗口
++        self.last_step_time = time.perf_counter()
++        self.recent_step_times = deque(maxlen=10)
++
+         while self.global_step < self.max_steps:
+             try:
+                 sample = next(data_iter)
+@@ -681,104 +687,161 @@ class Wan22Trainer:
+                         self.scheduler.step()
+                     self.optimizer.zero_grad(set_to_none=True)
+                     self.global_step += 1
++
++                # 记录最近 log_every 个 step 的耗时
++                now = time.perf_counter()
++                step_time = now - self.last_step_time
++                self.last_step_time = now
++                self.recent_step_times.append(step_time)
++
++                need_log = (
++                    self.log_every > 0
++                    and self.global_step % self.log_every == 0
++                )
++                global_loss = None
++                global_loss_metrics = {}
++                global_grad_norm = None
++
++                if need_log:
+                     global_loss = float(
+-                        self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
++                        self.accelerator.gather(
++                            loss.detach().float().reshape(1)
++                        ).mean().item()
+                     )
+-                    global_loss_metrics = {}
++
+                     for key, value in loss_dict.items():
+-                        metric_tensor = torch.tensor(float(value), device=loss.device, dtype=torch.float32).reshape(1)
++                        if torch.is_tensor(value):
++                            metric_tensor = value.detach().float().reshape(1)
++                        else:
++                            metric_tensor = torch.tensor(
++                                [float(value)],
++                                device=loss.device,
++                                dtype=torch.float32,
++                            )
+                         global_loss_metrics[key] = float(
+                             self.accelerator.gather(metric_tensor).mean().item()
+                         )
+-                    grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
+-                    global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
+ 
+-                    current_lr = float(self.optimizer.param_groups[0]["lr"])
++                    grad_norm_tensor = torch.tensor(
++                        grad_norm,
++                        device=loss.device,
++                        dtype=torch.float32
++                    ).reshape(1)
+ 
+-                    if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:
+-                        eta_str, steps_per_sec = self._estimate_eta()
+-                        description = "[train] epoch=%d step=%d/%d loss=%.4f " % (
+-                            self.epoch,
+-                            self.global_step,
+-                            self.max_steps,
+-                            global_loss,
++                    global_grad_norm = float(
++                        self.accelerator.gather(
++                            grad_norm_tensor
++                        ).mean().item()
++                    )
++
++
++                current_lr = float(self.optimizer.param_groups[0]["lr"])
++
++                if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:
++                    eta_str, _ = self._estimate_eta()
++
++                    # 最近 log_every 个 step 的平均速度
++                    if len(self.recent_step_times) > 0:
++                        recent_total_time = sum(self.recent_step_times)
++                        recent_steps_per_sec = len(self.recent_step_times) / max(recent_total_time, 1e-6)
++                    else:
++                        recent_steps_per_sec = 0.0
++
++                    recent_samples_per_sec = (
++                        recent_steps_per_sec
++                        * self.batch_size
++                        * self.accelerator.num_processes
++                    )
++
++                    description = "[train] epoch=%d step=%d/%d loss=%.4f " % (
++                        self.epoch,
++                        self.global_step,
++                        self.max_steps,
++                        global_loss,
++                    )
++
++                    if global_loss_metrics:
++                        detail_str = " ".join(
++                            [f"{k}={v:.4f}" for k, v in sorted(global_loss_metrics.items())]
+                         )
+-                        if global_loss_metrics:
+-                            detail_str = " ".join([f"{k}={v:.4f}" for k, v in sorted(global_loss_metrics.items())])
+-                            description += detail_str + " "
+-                        description += "lr=%.2e speed=%.2f step/s, %.2f samples/s eta=%s" % (
+-                            current_lr,
+-                            steps_per_sec,
+-                            steps_per_sec * self.batch_size * self.accelerator.num_processes,
+-                            eta_str,
++                        description += detail_str + " "
++
++                    description += "lr=%.2e speed=%.2f step/s, %.2f samples/s eta=%s" % (
++                        current_lr,
++                        recent_steps_per_sec,
++                        recent_samples_per_sec,
++                        eta_str,
++                    )
++
++                    logger.info(description)
++
++                    wandb_payload = {
++                        "train/loss": global_loss,
++                        "train/grad_norm": global_grad_norm,
++                        "train/lr": current_lr,
++                        "performance/steps_per_sec": recent_steps_per_sec,
++                        "performance/samples_per_sec": recent_samples_per_sec,
++                    }
++
++                    for key, value in global_loss_metrics.items():
++                        wandb_payload[f"train/{key}"] = value
++                    self._wandb_log(wandb_payload)
++
++                if (
++                    self.eval_every > 0
++                    and self.val_dataset is not None
++                    and self.global_step % self.eval_every == 0
++                ):
++                    metrics = self.evaluate()
++                    self.accelerator.wait_for_everyone()
++                    if metrics is not None and self.accelerator.is_main_process:
++                        description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
++                            self.global_step,
++                            metrics["val_loss"],
++                            metrics["psnr_rd"],
++                            metrics["ssim_rd"],
+                         )
++                        if "action_l2" in metrics:
++                            description += " action_l2=%.4f" % metrics["action_l2"]
++                        if "action_l1" in metrics:
++                            description += " action_l1=%.4f" % metrics["action_l1"]
+                         logger.info(description)
+-
+-                        wandb_payload = {
+-                            "train/loss": global_loss,
+-                            "train/grad_norm": global_grad_norm,
+-                            "train/lr": current_lr,
+-                            "performance/steps_per_sec": steps_per_sec,
+-                            "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes,
++                        eval_payload = {
++                            "eval/val_loss": float(metrics["val_loss"]),
++                            "eval/psnr_rg": float(metrics["psnr_rg"]),
++                            "eval/ssim_rg": float(metrics["ssim_rg"]),
++                            "eval/psnr_rd": float(metrics["psnr_rd"]),
++                            "eval/ssim_rd": float(metrics["ssim_rd"]),
++                            "eval/psnr_dg": float(metrics["psnr_dg"]),
++                            "eval/ssim_dg": float(metrics["ssim_dg"]),
+                         }
+-                        for key, value in global_loss_metrics.items():
+-                            wandb_payload[f"train/{key}"] = value
+-                        self._wandb_log(wandb_payload)
+-
+-                    if (
+-                        self.eval_every > 0
+-                        and self.val_dataset is not None
+-                        and self.global_step % self.eval_every == 0
+-                    ):
+-                        metrics = self.evaluate()
+-                        self.accelerator.wait_for_everyone()
+-                        if metrics is not None and self.accelerator.is_main_process:
+-                            description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
+-                                self.global_step,
+-                                metrics["val_loss"],
+-                                metrics["psnr_rd"],
+-                                metrics["ssim_rd"],
+-                            )
+-                            if "action_l2" in metrics:
+-                                description += " action_l2=%.4f" % metrics["action_l2"]
+-                            if "action_l1" in metrics:
+-                                description += " action_l1=%.4f" % metrics["action_l1"]
+-                            logger.info(description)
+-                            eval_payload = {
+-                                "eval/val_loss": float(metrics["val_loss"]),
+-                                "eval/psnr_rg": float(metrics["psnr_rg"]),
+-                                "eval/ssim_rg": float(metrics["ssim_rg"]),
+-                                "eval/psnr_rd": float(metrics["psnr_rd"]),
+-                                "eval/ssim_rd": float(metrics["ssim_rd"]),
+-                                "eval/psnr_dg": float(metrics["psnr_dg"]),
+-                                "eval/ssim_dg": float(metrics["ssim_dg"]),
+-                            }
+-                            if "action_l2" in metrics:
+-                                eval_payload["eval/action_l2"] = float(metrics["action_l2"])
+-                            if "action_l1" in metrics:
+-                                eval_payload["eval/action_l1"] = float(metrics["action_l1"])
+-                            self._wandb_log(eval_payload)
+-
+-                    if self.save_every > 0 and self.global_step % self.save_every == 0:
+-                        ckpt_info = self.save_checkpoint()
+-                        if self.accelerator.is_main_process:
+-                            logger.info(
+-                                "[ckpt] step=%d weights=%s state=%s",
+-                                self.global_step,
+-                                ckpt_info["weights_path"],
+-                                ckpt_info["state_path"],
+-                            )
++                        if "action_l2" in metrics:
++                            eval_payload["eval/action_l2"] = float(metrics["action_l2"])
++                        if "action_l1" in metrics:
++                            eval_payload["eval/action_l1"] = float(metrics["action_l1"])
++                        self._wandb_log(eval_payload)
++
++                if self.save_every > 0 and self.global_step % self.save_every == 0:
++                    ckpt_info = self.save_checkpoint()
++                    if self.accelerator.is_main_process:
++                        logger.info(
++                            "[ckpt] step=%d weights=%s state=%s",
++                            self.global_step,
++                            ckpt_info["weights_path"],
++                            ckpt_info["state_path"],
++                        )
++
++                if self.global_step >= self.max_steps:
++                    ckpt_info = self.save_checkpoint()
++                    if self.accelerator.is_main_process:
++                        logger.info(
++                            "[done] max_steps reached step=%d weights=%s state=%s",
++                            self.global_step,
++                            ckpt_info["weights_path"],
++                            ckpt_info["state_path"],
++                        )
++                    return
+ 
+-                    if self.global_step >= self.max_steps:
+-                        ckpt_info = self.save_checkpoint()
+-                        if self.accelerator.is_main_process:
+-                            logger.info(
+-                                "[done] max_steps reached step=%d weights=%s state=%s",
+-                                self.global_step,
+-                                ckpt_info["weights_path"],
+-                                ckpt_info["state_path"],
+-                            )
+-                        return
+ 
+         ckpt_info = self.save_checkpoint()
+         if self.accelerator.is_main_process:

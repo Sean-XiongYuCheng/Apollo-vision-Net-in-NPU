@@ -1,0 +1,61 @@
+name: security-compilation-options-scan-nightly
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 2 * * ?'
+
+permissions:
+  repository: read
+  id-token: write
+
+jobs:
+  scan:
+    name: scan-artifacts
+    runs-on: default
+    steps:
+      - name: Checkout
+        uses: checkout
+
+      # ===== 批量下载 DrivingSDK 根目录缓存产物 =====
+      - name: download-artifacts
+        id: download-artifacts
+        uses: obs-download
+        with:
+          endpoint: "obs.cn-north-4.myhuaweicloud.com"
+          bucket: "pytorch-package"
+          key: |
+            DrivingSDK/cache/DrivingSDK_v2.1.0_3.8_aarch64.tar.gz
+            DrivingSDK/cache/DrivingSDK_v2.6.0_3.9_aarch64.tar.gz
+            DrivingSDK/cache/DrivingSDK_v2.7.1_3.9_aarch64.tar.gz
+          path: "./artifacts/"
+          file-concurrency: "2"
+
+      # ===== 批量下载 A5 版本产物到独立子目录，避免与根目录同名文件互相覆盖 =====
+      - name: download-artifacts-a5
+        id: download-artifacts-a5
+        uses: obs-download
+        with:
+          endpoint: "obs.cn-north-4.myhuaweicloud.com"
+          bucket: "pytorch-package"
+          key: |
+            DrivingSDK/cache/A5/DrivingSDK_v2.1.0_3.8_aarch64.tar.gz
+            DrivingSDK/cache/A5/DrivingSDK_v2.6.0_3.9_aarch64.tar.gz
+            DrivingSDK/cache/A5/DrivingSDK_v2.7.1_3.9_aarch64.tar.gz
+          path: "./artifacts/A5/"
+          file-concurrency: "2"
+
+      # ===== 扫描指定产物并上传结果 =====
+      # artifact-path 精确指定只扫描这 6 个包，避免误扫目录中其他产物
+      # artifact-download-url 以 / 结尾视为URL前缀，插件自动拼接产物文件名
+      - name: security-compilation-options-scan
+        uses: openlibing/security-compilation-options-action@58cde4d25fb069e653dcc87d379a921fd89e831b
+        with:
+          artifact-path: |
+            ./artifacts/DrivingSDK_v2.1.0_3.8_aarch64.tar.gz
+            ./artifacts/DrivingSDK_v2.6.0_3.9_aarch64.tar.gz
+            ./artifacts/DrivingSDK_v2.7.1_3.9_aarch64.tar.gz
+            ./artifacts/A5/DrivingSDK_v2.1.0_3.8_aarch64.tar.gz
+            ./artifacts/A5/DrivingSDK_v2.6.0_3.9_aarch64.tar.gz
+            ./artifacts/A5/DrivingSDK_v2.7.1_3.9_aarch64.tar.gz
+          artifact-download-url: "https://pytorch-package.obs.cn-north-4.myhuaweicloud.com/DrivingSDK/cache/"

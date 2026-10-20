@@ -1,0 +1,8 @@
+numpy
+protobuf
+decorator
+sympy
+scipy
+attrs
+psutil
+pyyaml

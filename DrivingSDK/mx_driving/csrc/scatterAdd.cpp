@@ -1,0 +1,136 @@
+// Copyright (c) 2025 Huawei Technologies Co., Ltd
+// Copyright (c) 2019, Facebook CORPORATION.
+// All rights reserved.
+//
+// Licensed under the BSD 3-Clause License  (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// https://opensource.org/licenses/BSD-3-Clause
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "csrc/OpApiCommon.h"
+#include "csrc/functions.h"
+
+using namespace std;
+
+static void npu_scatter_add_shape_check(
+    const at::Tensor& src, const at::Tensor& indices, const at::Tensor& out, int dim, int max_index)
+{
+    auto src_size = src.sizes();
+    auto out_size = out.sizes();
+    auto indices_size = indices.sizes();
+    auto indices_dim = indices.dim();
+    TORCH_CHECK(dim < indices_dim, "Dimension out of range, dim expected to be in range of [", -indices_dim, ", ",
+        indices_dim - 1, "], but got ", dim);
+    TORCH_CHECK(src.dim() == out.dim(), "out's dimension should be equal to src's dimension.");
+    TORCH_CHECK(src.dim() >= indices.dim(), "indices's dimension should not larger than src's dimension.");
+    // shape of out and src
+    for (int i = 0; i < out.dim(); i++) {
+        if (i != dim) {
+            TORCH_CHECK(src_size[i] == out_size[i], "src and out should have the same size except for dim ", dim);
+        }
+    }
+
+    uint32_t last_indices_dim = 0;
+    if (indices_dim == 0) {
+        return;
+    }
+    for (int i = indices.dim() - 1; i >= 0; i--) {
+        if (indices_size[i] == 1) {
+            last_indices_dim++;
+        }
+    }
+    for (uint32_t i = 0; i < static_cast<uint32_t>(indices.dim()) - last_indices_dim; i++) {
+        TORCH_CHECK(src_size[i] == indices_size[i], "src and indices should have the same size at dim ", i);
+    }
+}
+
+at::Tensor npu_scatter_add(at::Tensor& src, at::Tensor& indices, c10::optional<at::Tensor> out,
+    c10::optional<int> dim, c10::optional<int> dim_size)
+{
+    TORCH_CHECK_NPU(src);
+    TORCH_CHECK_NPU(indices);
+
+    if (indices.numel() == 0 || src.numel() == 0) {
+        return out.value();
+    }
+
+    auto sizes = src.sizes().vec();
+    auto true_dim = dim.value();
+    int64_t true_dim_size;
+    auto max_index = indices.max().item().toLong();
+    if (dim_size.has_value()) {
+        true_dim_size = dim_size.value();
+    } else {
+        true_dim_size = max_index + 1;
+    }
+    auto indices_dim = indices.dim();
+    if (true_dim < 0) {
+        true_dim = true_dim + indices_dim;
+    }
+    TORCH_CHECK(true_dim < src.dim(), "dim should not exceed the dimension of input src");
+    sizes[true_dim] = true_dim_size;
+    at::Tensor true_out = out.value_or(at::zeros(sizes, src.options().dtype(at::kFloat)));
+
+    npu_scatter_add_shape_check(src, indices, true_out, true_dim, max_index);
+
+    int32_t dim_input = indices_dim == 0 ? 0 : indices_dim - 1;
+    src = src.transpose(true_dim, dim_input);
+    indices = indices.transpose(true_dim, dim_input);
+    at::Tensor out_trans = true_out.transpose(true_dim, dim_input).contiguous();
+
+    EXEC_NPU_CMD(aclnnScatterAddV1, src, indices, out_trans, dim_input, out_trans);
+
+    out_trans = out_trans.transpose(true_dim, dim_input).contiguous();
+    return out_trans;
+}
+
+at::Tensor npu_scatter_add_grad(at::Tensor& grad_out, at::Tensor& index, int32_t dim)
+{
+    TORCH_CHECK_NPU(grad_out);
+    TORCH_CHECK_NPU(index);
+    // construct the output tensor of the NPU
+    auto index_size = index.sizes();
+    auto grad_out_size = grad_out.sizes();
+    auto index_dims = index.sizes().size();
+    auto grad_out_dims = grad_out_size.size();
+    TORCH_CHECK(grad_out.scalar_type() == at::kFloat,
+        "grad_out: float32 tensor expected but got a tensor with dtype: ", grad_out.scalar_type());
+    TORCH_CHECK(index.scalar_type() == at::kInt,
+        "index: int32 tensor expected but got a tensor with dtype: ", index.scalar_type());
+    TORCH_CHECK(grad_out_dims != 0 && index_dims != 0, "grad_out and index should not be empty");
+
+    c10::SmallVector<int64_t, 8> grad_in_size;
+    for (uint32_t i = 0; i < grad_out_dims; i++) {
+        grad_in_size.push_back(grad_out_size[i]);
+    }
+    dim = (dim + static_cast<int32_t>(index_dims)) % static_cast<int32_t>(index_dims);
+    TORCH_CHECK(dim < grad_in_size.size(), "grad_out.dim() must greater than dim");
+    grad_in_size[dim] = index_size[dim];
+    for (uint32_t i = 0; i < grad_out_dims; i++) {
+        TORCH_CHECK(i >= index_dims || grad_in_size[i] == index_size[i], "the shape except dim should be the same");
+    }
+    uint64_t tail = 1;
+    for (uint32_t i = index_dims; i < grad_out_dims; i++) {
+        tail *= grad_out_size[i];
+    }
+    at::Tensor result;
+
+    auto inputDim = index_dims - 1;
+    grad_out = grad_out.transpose(dim, inputDim).contiguous();
+    index = index.transpose(dim, inputDim).contiguous();
+
+    auto grad_in_size_trans = grad_in_size;
+    grad_in_size_trans[inputDim] = grad_in_size[dim];
+    grad_in_size_trans[dim] = grad_in_size[inputDim];
+    result = at::zeros(grad_in_size_trans, grad_out.options());
+    EXEC_NPU_CMD(aclnnScatterAddGradV1, grad_out, index, inputDim, result);
+    result = result.transpose(dim, inputDim).contiguous();
+    return result;
+}

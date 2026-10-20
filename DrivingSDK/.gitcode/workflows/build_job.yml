@@ -1,0 +1,55 @@
+name: Build Job
+
+on:
+  workflow_call:
+    inputs:
+      pr_id:
+        required: false
+        type: string
+        default: ${{ atomgit.event.pull_request.number }}
+      CP_DOCKER_IMG:
+        required: true
+        type: string
+      runs_on_arch:
+        required: false
+        type: string
+        default: "x64"
+      runs_on_spec:
+        required: false
+        type: string
+        default: "cpu=32"
+      REMOTE_URL:
+        required: false
+        type: string
+        default: ${{ env.ATOMGIT_REPOSITORY_URL }}
+
+jobs:
+  Compile:
+    name: Compile
+    select: selected_by_default
+    runs-on: [ self-hosted,"${{ inputs.runs_on_arch }}", "${{ inputs.runs_on_spec }}" ]
+    container:
+      image: ${{ inputs.CP_DOCKER_IMG }}
+    steps:
+      - name: checkout DrivingSDK
+        uses: checkout
+        with:
+          ref: refs/merge-requests/${{ inputs.pr_id }}/merge
+          fetch-depth: 1
+          path: CODE
+          allow-unsafe-pr-checkout: true
+
+      - name: compile
+        run: |
+          git clone -b ${{ atomgit.event.repository.default_branch }} ${{ inputs.REMOTE_URL }} cie
+          cd cie/.gitcode/workflows/scripts
+          bash DrivingSDK_build.sh ${ATOMGIT_WORKSPACE} ${{inputs.pr_id}}
+          ls ${ATOMGIT_WORKSPACE}
+          
+      - name: Upload artifact
+        uses: upload-artifact
+        with:
+          name: DrivingSDK-${{ inputs.runs_on_arch }}
+          path: |
+            mx_driving*.whl
+          overwrite: true

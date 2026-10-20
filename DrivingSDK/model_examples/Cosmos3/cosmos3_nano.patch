@@ -1,0 +1,769 @@
+diff --git a/cosmos_framework/callbacks/device_monitor.py b/cosmos_framework/callbacks/device_monitor.py
+index 65fd1d4..3a6f064 100644
+--- a/cosmos_framework/callbacks/device_monitor.py
++++ b/cosmos_framework/callbacks/device_monitor.py
+@@ -102,7 +102,11 @@ class DeviceMonitor(EveryN):
+             log.info(f"{self.name} callback: local_dir: {self.local_dir}")
+ 
+         local_rank = int(os.getenv("LOCAL_RANK", 0))
+-        self.handle = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
++        try:
++            self.handle = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
++        except pynvml.NVMLError:
++            self.handle = None
++            log.warning(f"{self.name} callback: pynvml not available, monitoring disabled")
+ 
+     def every_n_impl(
+         self,
+@@ -113,6 +117,8 @@ class DeviceMonitor(EveryN):
+         loss: torch.Tensor,
+         iteration: int,
+     ) -> None:
++        if self.handle is None:
++            return
+         cur_process = psutil.Process(os.getpid())
+         # cur_process.children(recursive=True) can crash if the dataloader is constantly creating and destroying processes (e.g. calling FFmpeg).
+         try:
+diff --git a/cosmos_framework/checkpoint/dcp.py b/cosmos_framework/checkpoint/dcp.py
+index 7318e4a..537f4d5 100644
+--- a/cosmos_framework/checkpoint/dcp.py
++++ b/cosmos_framework/checkpoint/dcp.py
+@@ -645,7 +645,7 @@ class DistributedCheckpointer(AbstractCheckpointer):
+ 
+         if self.cpu_offload_state_dict is None:
+             log.info(f"Preparing the CPU memory for staging")
+-            self.cpu_offload_state_dict = _create_cpu_state_dict(state_dict, pin_memory=True, share_memory=True)
++            self.cpu_offload_state_dict = _create_cpu_state_dict(state_dict, pin_memory=False, share_memory=True)
+ 
+         log.info(f"Staging the state_dict in CPU memory")
+         with torch.cuda.stream(self.staging_stream):
+diff --git a/cosmos_framework/configs/base/experiment/sft/models/nano_model_config.py b/cosmos_framework/configs/base/experiment/sft/models/nano_model_config.py
+index 37f2689..9b07094 100644
+--- a/cosmos_framework/configs/base/experiment/sft/models/nano_model_config.py
++++ b/cosmos_framework/configs/base/experiment/sft/models/nano_model_config.py
+@@ -15,6 +15,9 @@ from cosmos_framework.configs.base.defaults.vlm import (
+ from cosmos_framework.model.vfm.mot.unified_mot import Qwen3VLMoTConfig, Qwen3VLTextForCausalLM
+ from cosmos_framework.utils.lazy_config import LazyCall as L
+ 
++import os
++PRETRAINED_MODEL_PATH = os.environ.get("PRETRAINED_MODEL_PATH", "")
++
+ NANO_MODEL_CONFIG = dict(
+     action_gen=True,
+     causal_training_strategy="none",
+@@ -117,7 +120,7 @@ NANO_MODEL_CONFIG = dict(
+     ),
+     vlm_config=dict(
+         layer_module="Qwen2MoTDecoderLayer",
+-        model_name="Qwen/Qwen3-VL-8B-Instruct",
++        model_name=PRETRAINED_MODEL_PATH,
+         tie_word_embeddings=False,
+         use_system_prompt=False,
+         pretrained_weights=dict(
+@@ -145,7 +148,7 @@ NANO_MODEL_CONFIG = dict(
+         ),
+         tokenizer=L(create_qwen2_tokenizer_with_download)(
+             config_variant="hf",
+-            pretrained_model_name="Qwen/Qwen3-VL-8B-Instruct",
++            pretrained_model_name=PRETRAINED_MODEL_PATH,
+         ),
+     ),
+ )
+diff --git a/cosmos_framework/model/attention/flash2/__init__.py b/cosmos_framework/model/attention/flash2/__init__.py
+index 85c7cbc..03b57a2 100644
+--- a/cosmos_framework/model/attention/flash2/__init__.py
++++ b/cosmos_framework/model/attention/flash2/__init__.py
+@@ -21,14 +21,8 @@ FLASH_ATTENTION_V2_MAX_VERSION = "2.7.4.post1"
+ 
+ 
+ def flash2_supported() -> bool:
+-    """
+-    Returns whether Flash Attention is supported in this environment.
+-    Requirements are:
+-        * Presence of CUDA Runtime (via PyTorch)
+-        * Presence of Flash Attention, meeting minimum version requirements
+-
+-    This check guards imports / dependencies on the Flash Attention package.
+-    """
++    if is_npu_environment():
++        return True
+     if not torch.cuda.is_available():
+         log.debug("Flash Attention v2 is not supported because PyTorch did not detect CUDA runtime.")
+         return False
+@@ -62,6 +56,14 @@ def flash2_supported() -> bool:
+     return True
+ 
+ 
++def is_npu_environment() -> bool:
++    try:
++        import torch_npu  # noqa: F401
++        return True
++    except ImportError:
++        return False
++
++
+ FLASH2_SUPPORTED = flash2_supported()
+ 
+ if FLASH2_SUPPORTED:
+@@ -70,4 +72,4 @@ if FLASH2_SUPPORTED:
+ else:
+     from cosmos_framework.model.attention.flash2.stubs import flash2_attention
+ 
+-__all__ = ["flash2_attention", "FLASH2_SUPPORTED"]
++__all__ = ["flash2_attention", "FLASH2_SUPPORTED", "is_npu_environment"]
+diff --git a/cosmos_framework/model/attention/flash2/checks.py b/cosmos_framework/model/attention/flash2/checks.py
+index 73fef61..7ac699d 100644
+--- a/cosmos_framework/model/attention/flash2/checks.py
++++ b/cosmos_framework/model/attention/flash2/checks.py
+@@ -13,12 +13,16 @@ from functools import partial
+ import torch
+ 
+ from cosmos_framework.model.attention.checks import attention_param_checks, attention_tensor_checks
+-from cosmos_framework.model.attention.flash2 import FLASH2_SUPPORTED
++from cosmos_framework.model.attention.flash2 import FLASH2_SUPPORTED, is_npu_environment
+ from cosmos_framework.model.attention.flash2.meta import get_bwd_dtypes, get_fwd_dtypes
+ from cosmos_framework.model.attention.masks import CausalType
+ from cosmos_framework.model.attention.utils import get_arch_tag, log_or_raise_error
+ 
+ 
++def _device_is_npu(device: torch.device) -> bool:
++    return is_npu_environment() and device.type == "npu"
++
++
+ def flash2_attention_check(
+     query_shape: torch.Size,
+     key_shape: torch.Size,
+@@ -75,7 +79,10 @@ def flash2_attention_check(
+         )
+         return False
+ 
+-    if is_varlen:
++    if _device_is_npu(device):
++        # NPU backend supports varlen via TND layout; skip the CUDA-specific varlen ban.
++        pass
++    elif is_varlen:
+         target_fn(
+             "Flash Attention v2 (flash2) varlen is banned due to instability. Please choose another backend.",
+             exception=ValueError,
+@@ -111,8 +118,5 @@ def flash2_attention_check(
+         causal_type=causal_type,
+     )
+ 
+-    if is_causal and causal_type not in [CausalType.BottomRight, CausalType.DontCare]:
+-        target_fn("Flash Attention v2 only supports bottom-right causal masking.", exception=RuntimeError)
+-        return False
+ 
+     return True
+diff --git a/cosmos_framework/model/attention/flash2/functions.py b/cosmos_framework/model/attention/flash2/functions.py
+index 2d1f491..d7fc7fb 100644
+--- a/cosmos_framework/model/attention/flash2/functions.py
++++ b/cosmos_framework/model/attention/flash2/functions.py
+@@ -9,13 +9,97 @@ Flash Attention v2 (flash2) Backend: intermediate APIs
+ Only safe to import when FLASH2_SUPPORTED is True.
+ """
+ 
+-from flash_attn.flash_attn_interface import flash_attn_func, flash_attn_varlen_func
++import os
++import warnings
++
++import torch
+ from torch import Tensor
+ 
++from cosmos_framework.model.attention.flash2 import is_npu_environment
++
++# Suppress triton deprecation warning that floods logs on NPU
++warnings.filterwarnings("ignore", message="tl.where with a non-boolean condition")
++
+ from cosmos_framework.model.attention.checks import assert_universal_tensor_checks
+ from cosmos_framework.model.attention.flash2.checks import flash2_attention_check
+ from cosmos_framework.model.attention.masks import CausalType
+ from cosmos_framework.model.attention.utils.environment import is_torch_compiling
++import warnings
++
++from cosmos_framework.model.attention.utils.safe_ops import log
++
++_IS_NPU = is_npu_environment()
++
++if _IS_NPU:
++    from torch_npu import npu_fusion_attention
++
++    _NPU_FA2_SPARSE_MODE = int(os.getenv("NPU_FA2_SPARSE_MODE", default=3))
++    _attn_mask_npu_cache: dict = {}
++
++    def _get_attn_mask_npu(device):
++        key = hash(device)
++        if key not in _attn_mask_npu_cache:
++            _attn_mask_npu_cache[key] = torch.triu(torch.ones([2048, 2048], device=device, dtype=torch.bool), diagonal=1)
++        return _attn_mask_npu_cache[key]
++
++
++    def _npu_attention_impl(query, key, value, is_varlen, cumulative_seqlen_Q, cumulative_seqlen_KV,
++                            max_seqlen_Q, max_seqlen_KV, scale, is_causal, backend_kwargs):
++        if is_varlen:
++            assert query.shape[0] == key.shape[0] == value.shape[0] == 1
++            q = query.squeeze(0)
++            k = key.squeeze(0)
++            v = value.squeeze(0)
++            assert q.dim() == k.dim() == v.dim() == 3
++
++            actual_seq_qlen = tuple(cumulative_seqlen_Q[1:].cpu().numpy().tolist())
++            actual_seq_kvlen = tuple(cumulative_seqlen_KV[1:].cpu().numpy().tolist())
++            if is_causal:
++                attn_mask = _get_attn_mask_npu(query.device)
++                out = npu_fusion_attention(
++                    q, k, v, q.shape[1],
++                    pse=None, padding_mask=None,
++                    atten_mask=attn_mask,
++                    scale=scale, keep_prob=1.0,
++                    input_layout="TND",
++                    actual_seq_qlen=actual_seq_qlen,
++                    actual_seq_kvlen=actual_seq_kvlen,
++                    sparse_mode=_NPU_FA2_SPARSE_MODE,
++                )[0]
++            else:
++                out = npu_fusion_attention(
++                    q, k, v, q.shape[1],
++                    pse=None, atten_mask=None,
++                    scale=scale, keep_prob=1.0,
++                    input_layout="TND",
++                    actual_seq_qlen=actual_seq_qlen,
++                    actual_seq_kvlen=actual_seq_kvlen,
++                )[0]
++
++            output = out.unsqueeze(0)
++            lse = None
++        else:
++            if is_causal:
++                attn_mask = _get_attn_mask_npu(query.device)
++                out = npu_fusion_attention(
++                    query, key, value, query.shape[2], "BSND",
++                    keep_prob=1.0, scale=scale,
++                    atten_mask=attn_mask,
++                    sparse_mode=_NPU_FA2_SPARSE_MODE,
++                )[0]
++            else:
++                out = npu_fusion_attention(
++                    query, key, value, query.shape[2], "BSND",
++                    keep_prob=1.0, scale=scale,
++                )[0]
++            output = out
++
++            # LSE computation skipped on NPU — not supported by npu_fusion_attention
++            lse = None
++
++        return output, lse
++else:
++    from flash_attn.flash_attn_interface import flash_attn_func, flash_attn_varlen_func
+ 
+ 
+ def flash2_attention(
+@@ -122,13 +206,21 @@ def flash2_attention(
+             )
+ 
+     scale = scale if scale is not None else query.shape[-1] ** -0.5
++    if return_lse and _IS_NPU:
++        warnings.warn(
++            "LSE (logsumexp) is not supported by the NPU backend. "
++            "return_lse=True with NPU may produce inaccurate results in attention merging.",
++            RuntimeWarning,
++            stacklevel=2,
++        )
+ 
+-    if is_varlen:
++    if _IS_NPU:
++        output, lse_ = _npu_attention_impl(
++            query, key, value, is_varlen, cumulative_seqlen_Q, cumulative_seqlen_KV,
++            max_seqlen_Q, max_seqlen_KV, scale, is_causal, backend_kwargs,
++        )
++    elif is_varlen:
+         assert query.shape[0] == key.shape[0] == value.shape[0] == 1
+-        q = query.squeeze(0)  # [total_tokens,H,D]
+-        k = key.squeeze(0)  # [total_tokens,Hkv,D]
+-        v = value.squeeze(0)  # [total_tokens,Hkv,Dv]
+-        assert q.dim() == k.dim() == v.dim() == 3
+         out, lse_, _ = flash_attn_varlen_func(
+             q=query.squeeze(0),
+             k=key.squeeze(0),
+@@ -142,45 +234,27 @@ def flash2_attention(
+             return_attn_probs=True,
+             deterministic=deterministic,
+             **backend_kwargs,
+-            # window_size=(-1, -1),
+-            # dropout_p=0.0,
+-            # softcap=0.0, # 0.0 means deactivated
+-            # alibi_slopes=None,
+-            # block_table=None,
+         )
+-        assert out.dim() == 3  # [total_tokens,H,Dv]
+-        assert lse_.dim() == 2  # [H,total_tokens]
+-
+-        output = out.unsqueeze(0)  # [1,total_tokens,H,Dv]
+-        lse = lse_.unsqueeze(0)  # [1,H,total_tokens]
++        assert out.dim() == 3
++        assert lse_.dim() == 2
++        output = out.unsqueeze(0)
++        lse_ = lse_.unsqueeze(0)
+ 
+     else:
+-        output, lse, _ = flash_attn_func(  # output: [B,N,H,Dv], lse: [B,H,N]
+-            q=query,
+-            k=key,
+-            v=value,
+-            softmax_scale=scale,
+-            causal=is_causal,
+-            return_attn_probs=True,
+-            deterministic=deterministic,
++        output, lse_, _ = flash_attn_func(
++            q=query, k=key, v=value,
++            softmax_scale=scale, causal=is_causal,
++            return_attn_probs=True, deterministic=deterministic,
+             **backend_kwargs,
+-            # window_size=(-1, -1),
+-            # dropout_p=0.0,
+-            # softcap=0.0, # 0.0 means deactivated
+-            # alibi_slopes=None,
+         )
+ 
+     assert isinstance(output, Tensor)
+-    assert isinstance(lse, Tensor)
+-    assert output.dim() == 4  # [B,N,H,Dv] or [1,total_tokens,H,Dv]
+-    assert lse.dim() == 3  # [B,H,N] or [1,H,total_tokens]
++    assert output.dim() == 4
+ 
+-    # NOTE: Do NOT call .contiguous on LSE, otherwise Attention Merging backward pass will be
+-    # incorrect. All output and lse tensors passed into `merge_attentions` must have the same data
+-    # pointer as their corresponding attention autograd ops!
+-    lse = lse.permute(0, 2, 1)  # [B,N,H] or [1,total_tokens,H]
++    if lse_ is not None:
++        assert lse_.dim() == 3
++        lse_ = lse_.permute(0, 2, 1)
+ 
+     if return_lse:
+-        return output, lse
+-
++        return output, lse_
+     return output
+diff --git a/cosmos_framework/model/attention/utils/__init__.py b/cosmos_framework/model/attention/utils/__init__.py
+index 67eaaae..3a28657 100644
+--- a/cosmos_framework/model/attention/utils/__init__.py
++++ b/cosmos_framework/model/attention/utils/__init__.py
+@@ -16,20 +16,32 @@ from cosmos_framework.model.attention.utils.determinism import torch_determinist
+ from cosmos_framework.model.attention.utils.environment import is_torch_compiling
+ from cosmos_framework.model.attention.utils.safe_ops import log
+ 
++ARCH_TAG_AMPERE = 80
+ 
+ def get_arch_tag(device: torch.device | None = None) -> int:
+     """
+-    Returns the compute capability of a given torch device if it's a CUDA device, otherwise returns 0.
++    Returns the compute capability (arch tag) of a given torch device.
++
++    For CUDA devices the value is the SM compute capability (e.g. 90 for
++    Hopper, 80 for Ampere). NPU devices (Ascend) have no compute capability,
++    so they are mapped to the Ampere arch tag (80) — the lowest value that
++    enables the flash2 / natten backends (see backends.get_backend_list and
++    flash2/meta.get_fwd_dtypes). Any other or unavailable device returns 0.
+ 
+     Args:
+         device (torch.device | None): torch device. Uses default device if None.
+ 
+     Returns:
+-        device_cc (int): compute capability in the SmXXX format (i.e. 90 for Hopper).
++        device_cc (int): compute capability in the SmXXX format (i.e. 90 for Hopper),
++                         or 80 for NPU devices, or 0 for unsupported devices.
+     """
+-    if torch.cuda.is_available() and torch.version.cuda and (device is None or device.type == "cuda"):
+-        major, minor = torch.cuda.get_device_capability(device)
+-        return major * 10 + minor
++    if torch.cuda.is_available():
++        if torch.version.cuda and (device is None or device.type == "cuda"):
++            major, minor = torch.cuda.get_device_capability(device)
++            return major * 10 + minor
++        return ARCH_TAG_AMPERE
++    if device is not None and device.type == "npu":
++        return ARCH_TAG_AMPERE
+     return 0
+ 
+ 
+diff --git a/cosmos_framework/model/vfm/mot/attention_test.py b/cosmos_framework/model/vfm/mot/attention_test.py
+index 56c2dee..2c0b6e9 100644
+--- a/cosmos_framework/model/vfm/mot/attention_test.py
++++ b/cosmos_framework/model/vfm/mot/attention_test.py
+@@ -6,7 +6,8 @@ from typing import cast
+ 
+ import pytest
+ import torch
+-
++import torch_npu
++from torch_npu.contrib import transfer_to_npu
+ import cosmos_framework.model.vfm.mot.attention as attention
+ from cosmos_framework.model.attention.natten import NATTEN_SUPPORTED
+ from cosmos_framework.data.vfm.sequence_packing import (
+@@ -76,9 +77,9 @@ def _test_attention_impls(
+     fn_1 = IMPL_TO_FN[impl_1]
+     fn_2 = IMPL_TO_FN[impl_2]
+ 
+-    use_compile = True
++    use_compile = False
+     test_backward: bool = True
+-    device = torch.device("cuda")
++    device = torch.device("npu")
+     num_q_heads = 32
+     num_kv_heads = 4
+     head_dim = 128
+diff --git a/cosmos_framework/model/vfm/omni_mot_model.py b/cosmos_framework/model/vfm/omni_mot_model.py
+index 652b930..c7c83fa 100644
+--- a/cosmos_framework/model/vfm/omni_mot_model.py
++++ b/cosmos_framework/model/vfm/omni_mot_model.py
+@@ -242,13 +242,9 @@ class OmniMoTModel(ImaginaireModel):
+         with misc.timer("meta to cuda and broadcast model states"):
+             net = net.to(dtype=dtype)
+             net.to_empty(device=DEVICE)
+-            if DEVICE == Device.CUDA:
+-                # Weight initialization is not needed for other devices (cpu,
+-                # meta), since they are only for checkpoint conversion and smoke
+-                # tests.
+-                net.init_weights(buffer_device=DEVICE)
+-                if getattr(self.config, "lora_enabled", False):
+-                    self._init_lora_weights_post_materialization(net)
++            net.init_weights(buffer_device=DEVICE)
++            if getattr(self.config, "lora_enabled", False):
++                self._init_lora_weights_post_materialization(net)
+ 
+         return net
+ 
+diff --git a/cosmos_framework/model/vfm/tokenizers/wan2pt2_vae_4x16x16.py b/cosmos_framework/model/vfm/tokenizers/wan2pt2_vae_4x16x16.py
+index 12dc6d5..1015bf0 100644
+--- a/cosmos_framework/model/vfm/tokenizers/wan2pt2_vae_4x16x16.py
++++ b/cosmos_framework/model/vfm/tokenizers/wan2pt2_vae_4x16x16.py
+@@ -84,15 +84,23 @@ class CausalConv3d(nn.Conv3d):
+             2 * self.padding[0],
+             0,
+         )
+-        self.padding = (0, 0, 0)
++        self._spatial_pad = (self.padding[1], self.padding[2])
++        self.padding = (0, 0, 0) 
+ 
+     def forward(self, x, cache_x=None):  # x: [B,C,T,H,W]
+-        padding = list(self._padding)
+         if cache_x is not None and self._padding[4] > 0:
+             cache_x = cache_x.to(x.device)
+             x = torch.cat([cache_x, x], dim=2)  # [B,C,T+cache_T,H,W]
+-            padding[4] -= cache_x.shape[2]
+-        x = F.pad(x, padding)  # [B,C,T_padded,H_padded,W_padded]
++        pad_t = self._padding[4]
++        if cache_x is not None:
++            pad_t -= cache_x.shape[2]
++        if pad_t > 0:
++            x = F.pad(x, (0, 0, 0, 0, pad_t, 0))
++        return F.conv3d(
++            x, self.weight, self.bias, self.stride,
++            padding=(0, *self._spatial_pad),
++            dilation=self.dilation, groups=self.groups,
++        )
+ 
+         return super().forward(x)  # [B,out_C,T_out,H_out,W_out]
+ 
+diff --git a/cosmos_framework/model/vfm/vlm/qwen3_vl/qwen3_vl.py b/cosmos_framework/model/vfm/vlm/qwen3_vl/qwen3_vl.py
+index 6a4d772..9fb4e2f 100644
+--- a/cosmos_framework/model/vfm/vlm/qwen3_vl/qwen3_vl.py
++++ b/cosmos_framework/model/vfm/vlm/qwen3_vl/qwen3_vl.py
+@@ -5,6 +5,7 @@
+ # This is adapted from src/transformers/models/qwen3_vl/modeling_qwen3_vl.py.
+ # Commit Hash: 41e5abac5cb49983a08ddef3e8645d6efd23c8f3
+ """PyTorch Qwen3-VL model."""
++import torch_npu
+ 
+ import functools
+ from dataclasses import dataclass
+@@ -150,8 +151,8 @@ def apply_rotary_pos_emb_vision(
+     orig_k_dtype = k.dtype
+     q, k = q.float(), k.float()
+     cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()  # [N_vision,1,head_dim]
+-    q_embed = (q * cos) + (rotate_half(q) * sin)  # [N_vision,num_heads,head_dim]
+-    k_embed = (k * cos) + (rotate_half(k) * sin)  # [N_vision,num_heads,head_dim]
++    q_embed = torch_npu.npu_rotary_mul(q, cos, sin)
++    k_embed = torch_npu.npu_rotary_mul(k, cos, sin)
+     q_embed = q_embed.to(orig_q_dtype)
+     k_embed = k_embed.to(orig_k_dtype)
+     return q_embed, k_embed  # [N_vision,num_heads,head_dim], [N_vision,num_heads,head_dim]
+@@ -353,7 +354,8 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
+     @torch.no_grad()
+     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
+     def forward(self, x, position_ids):
+-        assert self.inv_freq.dtype == torch.float32, f"inv_freq must be float32, but got {self.inv_freq.dtype}"
++        if self.inv_freq.dtype != torch.float32:
++            self.inv_freq = self.inv_freq.to(dtype=torch.float32)
+ 
+         # In contrast to other models, Qwen3VL has different position ids for the grids
+         # So we expand the inv_freq to shape (3, ...)
+@@ -383,11 +385,8 @@ class Qwen3VLTextRMSNorm(nn.Module):
+         self.variance_epsilon = eps
+ 
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+-        input_dtype = hidden_states.dtype
+-        hidden_states = hidden_states.to(torch.float32)
+-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+-        return self.weight * hidden_states.to(input_dtype)
++        out = torch_npu.npu_rms_norm(hidden_states, self.weight, epsilon=self.variance_epsilon)[0]
++        return out
+ 
+     def extra_repr(self) -> str:
+         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+diff --git a/cosmos_framework/model/vfm/vlm/qwen3_vl_moe/qwen3_vl_moe.py b/cosmos_framework/model/vfm/vlm/qwen3_vl_moe/qwen3_vl_moe.py
+index bd02d70..e873a53 100644
+--- a/cosmos_framework/model/vfm/vlm/qwen3_vl_moe/qwen3_vl_moe.py
++++ b/cosmos_framework/model/vfm/vlm/qwen3_vl_moe/qwen3_vl_moe.py
+@@ -1142,7 +1142,8 @@ class Qwen3VLMoeTextRotaryEmbedding(nn.Module):
+     @torch.no_grad()
+     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
+     def forward(self, x, position_ids):
+-        assert self.inv_freq.dtype == torch.float32, f"inv_freq must be float32, but got {self.inv_freq.dtype}"
++        if self.inv_freq.dtype != torch.float32:
++            self.inv_freq = self.inv_freq.to(dtype=torch.float32)
+ 
+         # In contrast to other models, Qwen3VLMoe has different position ids for the grids
+         # So we expand the inv_freq to shape (3, ...)
+diff --git a/cosmos_framework/scripts/convert_model_to_dcp.py b/cosmos_framework/scripts/convert_model_to_dcp.py
+index 2c78397..7ced5e4 100644
+--- a/cosmos_framework/scripts/convert_model_to_dcp.py
++++ b/cosmos_framework/scripts/convert_model_to_dcp.py
+@@ -32,7 +32,12 @@ from cosmos_framework.utils.checkpoint_db import _CHECKPOINTS
+ 
+ 
+ _AVAE_REGISTRY_URI = "s3://bucket/pretrained/tokenizers/audio/avae"
++_WAN_VAE_REGISTRY_URI = "s3://bucket/pretrained/tokenizers/video/wan2pt2/Wan2.2_VAE.pth"
++QWEN3VL_TOKENIZER_HF_PATH = "Qwen/Qwen3-VL-8B-Instruct"
+ 
++import os
++PRETRAINED_MODEL_PATH = os.environ.get("PRETRAINED_MODEL_PATH", "")
++WAN_VAE_PATH = os.environ.get("WAN_VAE_PATH", "")
+ 
+ def _redirect_avae_to_local(hf_path):
+     """Point the AVAE registry entry at hf_path/sound_tokenizer/.
+@@ -50,6 +55,25 @@ def _redirect_avae_to_local(hf_path):
+         avae.hf._path = str(sound_tokenizer_dir)
+ 
+ 
++def _redirect_qwen3vl_tokenizer():
++    """Point the Qwen3-VL tokenizer registry entry at the local"""
++    local_path = PRETRAINED_MODEL_PATH
++    register_checkpoints()
++    for uri, ckpt in _CHECKPOINTS.items():
++        if ckpt.name == QWEN3VL_TOKENIZER_HF_PATH and hasattr(ckpt, "hf") and ckpt.hf is not None:
++            ckpt.hf._path = local_path
++            break
++
++
++def _redirect_wan_vae_to_local():
++    """Point the Wan2.2 VAE registry entry at the local VAE file."""
++    local_path = WAN_VAE_PATH
++    register_checkpoints()
++    ckpt = _CHECKPOINTS.get(_WAN_VAE_REGISTRY_URI)
++    if ckpt is not None and hasattr(ckpt, "hf") and ckpt.hf is not None:
++        ckpt.hf._path = local_path
++
++
+ class Args(pydantic.BaseModel):
+     checkpoint: CheckpointOverrides
+     """Hugging Face checkpoint."""
+@@ -62,6 +86,8 @@ def convert_model_to_dcp(args: Args):
+     checkpoint_config = args.checkpoint.build_checkpoint(checkpoints=OmniSetupOverrides.CHECKPOINTS)
+     hf_path = checkpoint_config.download_checkpoint()
+     _redirect_avae_to_local(hf_path)
++    _redirect_qwen3vl_tokenizer()
++    _redirect_wan_vae_to_local()
+     model_dict = checkpoint_config.load_model_config_dict()
+     hf_config = Cosmos3OmniConfig(model=build_public_model_config(model_dict))
+     hf_model = Cosmos3OmniModel.from_pretrained_dcp(hf_path, config=hf_config)
+diff --git a/cosmos_framework/scripts/train.py b/cosmos_framework/scripts/train.py
+index 7d19e1c..7d073b6 100644
+--- a/cosmos_framework/scripts/train.py
++++ b/cosmos_framework/scripts/train.py
+@@ -28,6 +28,8 @@ import os
+ import traceback
+ 
+ import torch
++import torch_npu
++from torch_npu.contrib import transfer_to_npu
+ from loguru import logger as logging
+ 
+ from cosmos_framework.utils.config import Config
+@@ -214,7 +216,11 @@ def launch(config: Config, args: argparse.Namespace) -> None:
+     # Create the dataloaders.
+     with data_loader_init():
+         dataloader_train = instantiate(config.dataloader_train)
+-        dataloader_val = instantiate(config.dataloader_val)
++        try:
++            dataloader_val = instantiate(config.dataloader_val)
++        except FileNotFoundError as e:
++            logging.warning(f"Validation data not found ({e}), running without validation.")
++            dataloader_val = None
+ 
+     # Start training
+     trainer.train(
+@@ -225,6 +231,7 @@ def launch(config: Config, args: argparse.Namespace) -> None:
+ 
+ 
+ if __name__ == "__main__":
++
+     parser = argparse.ArgumentParser(description="SFT training (structured TOML)")
+     parser.add_argument(
+         "--sft-toml",
+diff --git a/cosmos_framework/trainer/__init__.py b/cosmos_framework/trainer/__init__.py
+index 5a63f22..c6f833b 100644
+--- a/cosmos_framework/trainer/__init__.py
++++ b/cosmos_framework/trainer/__init__.py
+@@ -28,7 +28,35 @@ from cosmos_framework.utils import callback, distributed, ema, log, misc
+ from cosmos_framework.utils.checkpointer import Checkpointer
+ from cosmos_framework.utils.misc import StragglerDetectorV2
+ 
+-
++import random
++import numpy as np
++
++def seed_all(seed=1234, mode=False, rm_dropout=False):
++    # 1. Python 层随机种子
++    os.environ['PYTHONHASHSEED'] = str(seed)
++    random.seed(seed)
++    np.random.seed(seed)
++    # 2. PyTorch 层随机种子
++    torch.manual_seed(seed)
++    if torch.cuda.is_available():
++        torch.cuda.manual_seed(seed)
++        torch.cuda.manual_seed_all(seed)
++    # 3. NPU 层随机种子（如果用了 torch_npu）
++    try:
++        import torch_npu
++        torch_npu.npu.manual_seed(seed)
++        torch_npu.npu.manual_seed_all(seed)
++    except ImportError:
++        pass
++    # 4. 开启 PyTorch 全局确定性算法
++    if mode:
++        torch.use_deterministic_algorithms(True, warn_only=False)
++        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
++
++if os.environ.get("SEED_ALL_ENABLED", "false").lower() != "true":
++    seed = int(os.environ.get("SEED_ALL_SEED", "1234"))
++    mode = os.environ.get("SEED_ALL_MODE", "false").lower() == "true"
++    seed_all(seed=seed, mode=mode)
+ 
+ class ImaginaireTrainer:
+     """The base trainer class of Imaginaire.
+@@ -307,7 +335,7 @@ class ImaginaireTrainer:
+                         self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=iteration)
+                     self.callbacks.on_training_step_end(model, data_batch, output_batch, loss, iteration=iteration)
+                     # Validation.
+-                    if self.config.trainer.run_validation and iteration % self.config.trainer.validation_iter == 0:
++                    if (self.config.trainer.run_validation and dataloader_val is not None and iteration % self.config.trainer.validation_iter == 0):
+                         self.validate(model, dataloader_val, iteration=iteration)
+                     # This iteration is successful; reset the timeout signal.
+                     signal.alarm(self.config.trainer.timeout_period)
+diff --git a/cosmos_framework/utils/device.py b/cosmos_framework/utils/device.py
+index 7bc2f88..48844f9 100644
+--- a/cosmos_framework/utils/device.py
++++ b/cosmos_framework/utils/device.py
+@@ -89,7 +89,11 @@ class Device:
+ 
+     def __init__(self, device_idx: int):
+         super().__init__()
+-        self.handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
++        try:
++            pynvml.nvmlInit()
++            self.handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
++        except pynvml.NVMLError:
++            self.handle = None
+ 
+     def get_name(self) -> str:
+         return pynvml.nvmlDeviceGetName(self.handle)
+diff --git a/cosmos_framework/utils/distributed.py b/cosmos_framework/utils/distributed.py
+index 64e0de7..fc26673 100644
+--- a/cosmos_framework/utils/distributed.py
++++ b/cosmos_framework/utils/distributed.py
+@@ -36,12 +36,11 @@ def init() -> int | None:
+         return torch.cuda.current_device()
+ 
+     # Set GPU affinity.
+-    pynvml.nvmlInit()
+     local_rank = int(os.getenv("LOCAL_RANK", 0))
+     try:
+         device = Device(local_rank)
+         os.sched_setaffinity(0, device.get_cpu_affinity())
+-    except pynvml.NVMLError as e:
++    except Exception as e:
+         log.warning(f"Failed to set device affinity: {e}")
+     # Set up NCCL communication.
+     os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "0"
+diff --git a/cosmos_framework/utils/flags.py b/cosmos_framework/utils/flags.py
+index 05a22cf..d2918bb 100644
+--- a/cosmos_framework/utils/flags.py
++++ b/cosmos_framework/utils/flags.py
+@@ -53,6 +53,7 @@ class Device(StrEnum):
+     CUDA = "cuda"
+     CPU = "cpu"
+     META = "meta"
++    NPU = "npu"
+ 
+ 
+ DEVICE: Final[Device] = Device(os.environ.get("COSMOS_DEVICE", "cuda").lower())
+diff --git a/examples/toml/sft_config/videophy2_sft_nano.toml b/examples/toml/sft_config/videophy2_sft_nano.toml
+index a183db3..3e671f2 100644
+--- a/examples/toml/sft_config/videophy2_sft_nano.toml
++++ b/examples/toml/sft_config/videophy2_sft_nano.toml
+@@ -22,11 +22,11 @@ name         = "videophy2_sft_nano"
+ wandb_mode   = "disabled"
+ 
+ [model]
+-attn_implementation = "cosmos"
++attn_implementation = "sdpa"
+ precision           = "bfloat16"                         # was [model.parallelism].precision
+ 
+ [model.backbone]
+-model_name = "Qwen/Qwen3-VL-8B-Instruct"
++model_name = "${oc.env:PRETRAINED_MODEL_PATH}"
+ 
+ [model.ema]
+ enabled         = false
+diff --git a/examples/toml/sft_config/vision_sft_nano.toml b/examples/toml/sft_config/vision_sft_nano.toml
+index dbb192d..fdbd283 100644
+--- a/examples/toml/sft_config/vision_sft_nano.toml
++++ b/examples/toml/sft_config/vision_sft_nano.toml
+@@ -28,12 +28,12 @@ data_parallel_shard_degree      = -1                     # -1 = auto from WORLD_
+ data_parallel_replicate_degree  = 1
+ 
+ [model.compile]
+-enabled                         = true                   # was [model.parallelism].use_torch_compile
+-compile_dynamic                 = true
++enabled                         = false                   # was [model.parallelism].use_torch_compile
++compile_dynamic                 = false
+ 
+ [model.activation_checkpointing]
+ mode                = "full"
+-save_ops_regex      = ["fmha"]
++save_ops_regex      =  ["attention"]
+ preserve_rng_state  = true
+ determinism_check   = "default"
+ 
+@@ -79,7 +79,7 @@ force_finite = true
+ 
+ [checkpoint]
+ keys_to_skip_loading = ["net_ema."]
+-load_path            = "${oc.env:BASE_CHECKPOINT_PATH}"
++load_path            = ""
+ save_iter            = 100
+ 
+ [dataloader_train]
+diff --git a/pyproject.toml b/pyproject.toml
+index f3fffd9..53e4a28 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -195,6 +195,7 @@ cu128 = [
+ ]
+ cu128-train = [
+   {include-group = "cu128"},
++  {include-group = "train"},
+   "torchao==0.16.0+cu128; platform_machine == 'x86_64'", # https://github.com/pytorch/ao/issues/2919
+   "transformer-engine==2.12.0+cu128.torch210",
+   "triton==3.6.0",
