@@ -1,0 +1,15 @@
+# Apollo昇腾NPU FP32源码版本
+# 生成日期：2026-10-20
+
+Apollo-Vision-Net            commit=540ad5e3bb61845f2b885017d2de75e301b2dfa4 ref=release/fp32
+DrivingSDK                   commit=ad53cd15fc5ff9211f33e8c69af630d80458e75c ref=master
+mmcv                         commit=ac5854e830b4728430a0ff3f203b99b60bdcefda ref=release/apollo-fp32
+mmdetection_2.19             commit=6daf8d2c759759253d4f3540da969d79cee609b4 ref=release/apollo-fp32
+mmsegmentation_0.20          commit=1ee834eee994db04962d19618f2127a06b95b417 ref=release/apollo-fp32
+mmdetection3d_0.18.1         commit=818b7260b296290570735ba4184e3fd26167673c ref=release/apollo-fp32
+
+# 参考代码
+BEVFormer                    commit=66b65f3a1f58caf0507cb2a971b9c0e7f842376c ref=v2.0-32-g66b65f3
+detectron2                   commit=1e3e13bbf607b54f62205c4c33922521822fb298 ref=main
+mmdetection_2.24             commit=1376e77e6ecbaad609f6003725158de24ed42e84 ref=v2.24.0
+mmdetection3d_1.0rc4         commit=c9541b0db89498fdea5cafd05b7b17f7b625b858 ref=v1.0.0rc4
